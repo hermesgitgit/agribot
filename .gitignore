@@ -1,0 +1,29 @@
+# ---- 執行期資料（volume，不進版控）----
+# SQLite（sensor_history/temp_log/rain_log/daily_summaries…）、照片、心跳檔、
+# state.json、知識庫 knowledge.db 等都在這裡，屬執行期狀態與大型建置產物。
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ---- 機密 ----
+.env
+.env.*
+*.secret
+
+# ---- Python 快取 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- 日誌與備份 ----
+*.log
+*.bak
+
+# ---- 作業系統 / 編輯器雜物 ----
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,9 @@
+# 不要烤進映像檔的東西：
+# data/ 是執行期 volume（SQLite、照片、心跳檔），映像檔裡不該有一份舊快照
+data/
+# 舊單檔備份與本機測試工具
+*.bak
+baseline_names.txt
+import_test.sh
+# 祕密
+.env
