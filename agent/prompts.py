@@ -1,3 +1,19 @@
+# agribot - 自主農務監控 Telegram bot
+# Copyright (C) 2026 Hou-ming Huang
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 # ======================================================================
 # 系統指令與 prompt 背景組裝 (Agent Prompts)
 # ======================================================================
@@ -171,6 +187,42 @@ def build_disease_report(air_temp=None, air_humidity=None) -> str:
         if block:
             report += "\n\n" + block
     return report
+
+
+# 病蟲害/栽培/防治類問題：由系統「先查知識庫、把官方節錄塞進該輪背景」，確保模型手上
+# 有書名可引——不再賭它會不會自己呼叫 tool_search_agri_knowledge（對應行為測試 M5）。
+_KB_TOPIC_KEYWORDS = ("病", "蟲", "防治", "預防", "病害", "蟲害", "病斑", "黴", "霉",
+                      "枯", "爛", "斑點", "萎", "栽培", "種植", "怎麼種")
+
+
+def build_kb_context(user_text: str) -> str:
+    """
+    使用者訊息若屬病蟲害/栽培/防治類，先查知識庫並回傳可注入 prompt 的官方節錄文字；
+    非此類、或查無對應內容時回空字串（讓對話照常，由系統指令要求模型如實說明查無文獻）。
+    把「該不該引用知識庫」從模型的自由裁量改成系統的確定性預取。
+    """
+    from science.gdd import CROP_GDD_DATABASE
+    from storage.knowledge import search_knowledge
+    from storage.state import active_crops
+
+    t = user_text or ""
+    if not any(k in t for k in _KB_TOPIC_KEYWORDS):
+        return ""
+    crops = active_crops(load_state())
+    # 焦點查詢：訊息或在種作物的名稱 + 主題詞（病害/蟲害/栽培）
+    crop_term = ""
+    for c in list(CROP_GDD_DATABASE.keys()) + list(crops):
+        head = str(c).split()[0]
+        if head and head in t:
+            crop_term = head
+            break
+    if not crop_term and crops:
+        crop_term = str(crops[0]).split()[0]
+    topic = "蟲害" if "蟲" in t else ("栽培" if any(w in t for w in ("栽培", "種植", "怎麼種")) else "病害")
+    result = search_knowledge(f"{crop_term} {topic}".strip())
+    if any(s in result for s in ("找不到", "尚未安裝", "請提供")):
+        return ""
+    return result
 
 
 def get_current_time_context() -> str:

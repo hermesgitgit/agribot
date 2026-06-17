@@ -7,3 +7,8 @@ baseline_names.txt
 import_test.sh
 # 祕密
 .env
+# 版控與作業系統中繼資料：不該進 build context（.git 會隨每次部署快照長大、拖慢 build）
+.git/
+@eaDir/
+__pycache__/
+.DS_Store

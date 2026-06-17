@@ -27,3 +27,10 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+Icon?
+
+# ---- Synology Drive / NAS 中繼資料 ----
+.SynologyWorkingDirectory/
+@eaDir/
+*.SynoEAStream
+*.SynoResource

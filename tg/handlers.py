@@ -1,3 +1,19 @@
+# agribot - 自主農務監控 Telegram bot
+# Copyright (C) 2026 Hou-ming Huang
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 # ======================================================================
 # Telegram 訊息處理 (Handlers)
 # ======================================================================
@@ -17,7 +33,7 @@ from agent.pending import (
     classify_confirmation, clear_pending_event, commit_pending_event,
     get_pending_event, set_current_chat_context,
 )
-from agent.prompts import build_state_summary, get_current_time_context
+from agent.prompts import build_kb_context, build_state_summary, get_current_time_context
 from agent.session import (
     get_chat_lock, get_or_create_chat, is_session_fresh, reset_chat, send_message_with_retry,
 )
@@ -419,6 +435,17 @@ async def handle_message(message):
                 "若使用者指涉先前的對話內容，請坦白說明記憶已重置並請他補充，切勿裝懂。"
             )
 
+        # 病蟲害/栽培/防治類問題：系統先查知識庫、把官方節錄塞進背景，確保模型有書名可引
+        kb_context = await asyncio.to_thread(build_kb_context, user_input_text)
+        kb_block = ""
+        if kb_context:
+            kb_block = (
+                "【系統為本題預先檢索的農業部官方文獻】\n"
+                f"{kb_context}\n"
+                "（回答病蟲害/栽培/防治時，請優先依據上列官方文獻、並在回覆中引用書名《》；"
+                "資訊不足可再自行呼叫 tool_search_agri_knowledge。）\n\n"
+            )
+
         full_prompt = (
             f"{user_block}\n"
             f"（請先判斷並直接回應上述訊息的意圖：若它是對話、澄清或糾正，自然簡短回應即可、"
@@ -428,7 +455,8 @@ async def handle_message(message):
             + (f"{last_push_brief}\n\n" if last_push_brief else "")
             + f"{fertilizer_summary}\n\n"
             f"{prediction_feedback}\n\n"
-            f"（提示：如需即時感測數據、天氣預報、近期歷史或長期日彙總，請自主呼叫對應工具後再下結論。）"
+            + kb_block
+            + f"（提示：如需即時感測數據、天氣預報、近期歷史或長期日彙總，請自主呼叫對應工具後再下結論。）"
         )
 
         prompt_parts.append(full_prompt)
