@@ -25,25 +25,53 @@ from config import TELEGRAM_TOKEN, redact
 from logging_setup import logger
 
 
-async def send_telegram_message(chat_id, text):
+# ======================================================================
+# 耕地狀況快捷按鍵 (Reply Keyboard)
+# ======================================================================
+# 輸入框下方常駐的快捷按鍵：點一下即等同送出對應文字，免去重複手打。
+# 兩顆按鍵服務最高頻的「查耕地狀況」需求：
+#   - 耕地快照：走本地 /status，秒回、不爬新數據、零 AI 額度。
+#   - 完整分析：等同打「現在耕地的狀況如何？」，交 AI 即時爬取後給完整建議。
+# 常數放在發送端模組，供 handlers（攔截按鍵）與 main（啟動掛鍵盤）共用，
+# 且 api.py 不反向 import 任何上層模組，無循環依賴之虞。
+BTN_SNAPSHOT = "🌱 耕地快照"
+BTN_FULL_ANALYSIS = "🔍 完整分析"
+FARM_STATUS_QUESTION = "現在耕地的狀況如何？"
+
+FARM_KEYBOARD = {
+    "keyboard": [[{"text": BTN_SNAPSHOT}, {"text": BTN_FULL_ANALYSIS}]],
+    "resize_keyboard": True,    # 依按鍵數量自動縮成單列高度，不占滿半個螢幕
+    "is_persistent": True,      # 常駐顯示（使用者收合後仍可隨時再叫出）
+    "input_field_placeholder": "輸入訊息，或點下方按鍵查耕地狀況…",
+}
+
+
+async def send_telegram_message(chat_id, text, reply_markup=None):
     """
     發送 Telegram 訊息（強化版）：
     1. 自動分段：超過 Telegram 4096 字元上限的訊息切塊連發，不再整則發送失敗。
     2. Markdown 渲染：先以 parse_mode=Markdown 發送（AI 回覆與報告中的 **粗體**、
        `等寬` 才能正常顯示而非字面星號）；若內容含不成對符號導致解析失敗
        （HTTP 400），自動退回純文字重送——訊息永不因格式問題而遺失。
+    3. reply_markup（選用）：附帶 reply keyboard 等鍵盤定義。分段時只掛在
+       最後一段，避免每段都重設鍵盤。
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     loop = asyncio.get_running_loop()
     text = "" if text is None else str(text)
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
+        is_last = idx == len(chunks) - 1
         try:
             payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"}
+            if reply_markup is not None and is_last:
+                payload["reply_markup"] = reply_markup
             r = await loop.run_in_executor(
                 None, lambda p=payload: requests.post(url, json=p, timeout=10))
             if r.status_code == 400:
                 plain = {"chat_id": chat_id, "text": chunk}
+                if reply_markup is not None and is_last:
+                    plain["reply_markup"] = reply_markup
                 r = await loop.run_in_executor(
                     None, lambda p=plain: requests.post(url, json=p, timeout=10))
             if r.status_code != 200:

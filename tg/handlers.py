@@ -50,7 +50,10 @@ from storage.predictions import load_prediction_feedback
 from storage.pushlog import load_last_push_brief
 from storage.vision_log import load_visual_history
 from storage.state import active_crops, load_state, set_crop_tracking, update_state
-from tg.api import download_telegram_photo, send_telegram_message, send_typing_action
+from tg.api import (
+    BTN_FULL_ANALYSIS, BTN_SNAPSHOT, FARM_KEYBOARD, FARM_STATUS_QUESTION,
+    download_telegram_photo, send_telegram_message, send_typing_action,
+)
 from watchdog import SCRAPER_FAILURE_ALERT_THRESHOLD, WATCHDOG_LOCK, WATCHDOG_STATE
 
 
@@ -81,9 +84,11 @@ async def handle_local_command(chat_id, text) -> bool:
             "/threshold dry=30 wet=80 — 手動設定土壤濕度警戒門檻（全園共用）\n"
             "/crop 空心菜 — 設定對話焦點作物\n"
             "/reset — 清空 AI 對話歷史\n"
+            "👇 輸入框下方常駐兩顆快捷鍵：「🌱 耕地快照」＝秒回現況（同 /status）、"
+            "「🔍 完整分析」＝即時爬取後做完整 AI 評估。\n"
             "💬 也可以直接自然地告訴我「我收成了」「我施肥了」或上傳收成照片，"
             "我會幫你登記（登記前會跟你確認一次）。"
-        ))
+        ), reply_markup=FARM_KEYBOARD)
         return True
 
     if cmd == "/health":
@@ -302,6 +307,17 @@ async def handle_message(message):
     else:
         logger.info(f"📩 收到擁有者訊息: {text}")
 
+    # 🌱 耕地狀況快捷按鍵（輸入框下方常駐 reply keyboard）
+    if not photo and text == BTN_SNAPSHOT:
+        # 耕地快照：直接走本地 /status，秒回、不爬新數據、零 AI 額度
+        await handle_local_command(chat_id, "/status")
+        return
+    if not photo and text == BTN_FULL_ANALYSIS:
+        # 完整分析：等同使用者輸入「現在耕地的狀況如何？」，往下交由 AI
+        # 即時爬取後分析。改寫 text/user_input_text 後讓流程照常進行。
+        text = FARM_STATUS_QUESTION
+        user_input_text = FARM_STATUS_QUESTION
+
     # ⚙️ 待確認事件攔截：若上一輪 AI 發起了收成/施肥登記且尚在等待確認，
     # 這一則訊息優先當作「確認回覆」處理（預設會記、明確否定才取消）。
     pending = get_pending_event(chat_id)
@@ -329,10 +345,12 @@ async def handle_message(message):
         clear_pending_event(chat_id)
         reset_chat(chat_id)
         await send_telegram_message(
-            chat_id, 
+            chat_id,
             "🌱 歡迎使用智慧農務 Agentic Bot！已為您清空對話歷史，現在可以重新設定或詢問囉！\n"
             "例如：「我現在剛種了空心菜幼苗，今天需要澆水嗎？」\n"
-            "輸入 /help 可查看本地快速指令（查狀態、查積溫、手動設門檻，即時回覆且不耗 AI 額度）。"
+            "👇 輸入框下方有兩顆快捷鍵：「🌱 耕地快照」秒回現況、「🔍 完整分析」做即時完整評估。\n"
+            "輸入 /help 可查看本地快速指令（查狀態、查積溫、手動設門檻，即時回覆且不耗 AI 額度）。",
+            reply_markup=FARM_KEYBOARD
         )
         return
 

@@ -29,7 +29,7 @@ from science.gdd_engine import check_and_update_gdd
 from services.push import scheduled_push_loop
 from storage.pushlog import record_push
 from services.sentinel import hourly_safety_check_loop
-from tg.api import send_telegram_message
+from tg.api import FARM_KEYBOARD, send_telegram_message
 from tg.loop import telegram_bot_loop
 from watchdog import check_previous_heartbeat, watchdog_loop
 
@@ -45,10 +45,12 @@ async def main():
                 f"⚠️【系統重新上線】偵測到先前心跳中斷約 {gap_text}（最後心跳：{last_ts}）。\n"
                 f"離線期間的哨兵巡檢、定時推播與感測記錄可能缺漏；"
                 f"缺漏的 GDD 結算與日彙總將於本次啟動自動回補（最多 {GDD_BACKFILL_MAX_DAYS} 天，"
-                f"無實測數據的日子會誠實標記跳過）。")
+                f"無實測數據的日子會誠實標記跳過）。",
+                reply_markup=FARM_KEYBOARD)
             logger.warning(f"⚠️ [Watchdog] 偵測到系統曾離線約 {gap_min} 分鐘（最後心跳: {last_ts}）。")
         else:
-            await send_telegram_message(int(TELEGRAM_CHAT_ID), "✅ 智慧農務 Bot 已啟動，所有背景迴圈就緒。")
+            await send_telegram_message(int(TELEGRAM_CHAT_ID),
+                "✅ 智慧農務 Bot 已啟動，所有背景迴圈就緒。", reply_markup=FARM_KEYBOARD)
     except Exception as e:
         logger.warning(f"⚠️ [Watchdog] 啟動通知發送失敗: {e}")
     
