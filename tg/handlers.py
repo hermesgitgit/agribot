@@ -36,6 +36,7 @@ from agent.pending import (
 from agent.prompts import build_kb_context, build_state_summary, get_current_time_context
 from agent.session import (
     get_chat_lock, get_or_create_chat, is_session_fresh, reset_chat, send_message_with_retry,
+    transcribe_voice,
 )
 from config import HEARTBEAT_FILE, HEARTBEAT_URL, TELEGRAM_CHAT_ID, redact
 from logging_setup import logger
@@ -298,6 +299,24 @@ async def handle_message(message):
     if str(chat_id) != str(TELEGRAM_CHAT_ID):
         logger.info(f"🔒 已靜默忽略未授權的對話請求。Chat ID: {chat_id}")
         return
+
+    # 🎤 語音訊息：先用 Gemini 轉成文字，之後一律當「使用者打的字」跑既有流程，
+    # 既有功能（查狀況、記施肥/收成、問澆水…）語音全可用。適合田裡髒手濕手按住說。
+    voice = message.get("voice") or message.get("audio")
+    if voice and not photo and not text:
+        await send_typing_action(chat_id)
+        audio_bytes = await download_telegram_photo(voice["file_id"])  # 同一支下載函式，內容不限照片
+        if not audio_bytes:
+            await send_telegram_message(chat_id, "⚠️ 語音下載失敗，請再說一次或改用打字。")
+            return
+        transcript = await asyncio.to_thread(
+            transcribe_voice, audio_bytes, voice.get("mime_type", "audio/ogg"))
+        if not transcript:
+            await send_telegram_message(chat_id, "⚠️ 這段語音我沒聽清楚，請靠近一點再說一次，或改用打字。")
+            return
+        # 回放聽到的內容，讓你一眼確認沒誤解（誤聽可立刻再說；記施肥/收成另有確認制把關）
+        await send_telegram_message(chat_id, f"🎤 我聽到的是：「{transcript}」")
+        text = transcript  # 之後流程與打字完全一致
 
     user_input_text = caption if photo else text
 

@@ -71,7 +71,8 @@ async def telegram_bot_loop():
                 for update in response.get("result", []):
                     offset = update["update_id"] + 1
                     message = update.get("message")
-                    if message and ("text" in message or "photo" in message):
+                    if message and ("text" in message or "photo" in message
+                                    or "voice" in message or "audio" in message):
                         asyncio.create_task(handle_message(message))
                 if response.get("result"):
                     try:

@@ -38,7 +38,7 @@ from google.genai import errors, types
 
 from agent.prompts import SYSTEM_INSTRUCTION
 from agent.tools import AGENT_TOOLS
-from config import GEMINI_API_KEY, now_taipei
+from config import GEMINI_API_KEY, now_taipei, redact
 from logging_setup import logger
 
 MODEL_NAME = "gemini-2.5-flash"
@@ -55,6 +55,10 @@ _AGENT_CONFIG = types.GenerateContentConfig(
 
 # 防呆重試專用：不帶工具，模型只能把分析寫成文字。
 _NO_TOOLS_CONFIG = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION)
+
+# 語音轉錄專用：刻意「不帶」農業系統指令（免得模型去詮釋而非逐字聽寫）、
+# 不帶工具、temperature=0 求忠實。
+_TRANSCRIBE_CONFIG = types.GenerateContentConfig(temperature=0.0)
 
 
 def is_transient_api_error(e) -> bool:
@@ -148,6 +152,32 @@ def generate_oneshot_no_tools(prompt_parts, max_retries=3, delay=65):
         lambda: _client.models.generate_content(
             model=MODEL_NAME, contents=prompt_parts, config=_NO_TOOLS_CONFIG),
         max_retries, delay)
+
+
+def transcribe_voice(audio_bytes, mime_type="audio/ogg") -> str:
+    """
+    將 Telegram 語音訊息轉成繁體中文逐字文字（直接用 Gemini 多模態吃音檔，
+    不另接 STT 服務）。指定台灣使用者情境、只輸出聽到的內容本身，
+    避免簡體字、贅語或把口述「詮釋」成別的東西。
+    轉錄失敗或聽不清一律回空字串，由呼叫端決定如何回應（誠實原則：
+    寧可請使用者再說一次，也不亂猜一個可能誤觸發操作的句子）。
+    Telegram 語音為 OGG/Opus；先直接餵，若日後實測 Gemini 不收此格式，
+    再於 Dockerfile 加 ffmpeg 轉檔。
+    """
+    prompt = (
+        "這是一段台灣使用者用中文（可能夾雜台語）講的農務操作語音。"
+        "請逐字轉成繁體中文（台灣慣用語）純文字，只輸出你聽到的內容本身，"
+        "不要加任何說明、引號、標點修飾或翻譯。完全聽不清楚就輸出空白。"
+    )
+    try:
+        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type or "audio/ogg")
+        resp = _call_with_retry(
+            lambda: _client.models.generate_content(
+                model=MODEL_NAME, contents=[prompt, audio_part], config=_TRANSCRIBE_CONFIG))
+        return (resp.text or "").strip()
+    except Exception as e:
+        logger.warning(f"⚠️ [Voice] 語音轉錄失敗: {redact(e)}")
+        return ""
 
 
 chat_sessions = {}  # chat_id -> {"chat": Chat, "created_date": "YYYY-MM-DD"}
