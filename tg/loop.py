@@ -17,7 +17,8 @@
 # ======================================================================
 # Telegram Long-Polling 迴圈
 # ======================================================================
-# offset 持久化落盤防重複處理；訊息以 asyncio.create_task 併發分發給 handlers。
+# offset 持久化落盤防重複處理；訊息逐則「處理完成才推進 offset」（at-least-once，
+# 中途 crash/重啟會由 Telegram 重送），handler 以 wait_for 設逾時保險避免卡死整個迴圈。
 import asyncio
 import json
 
@@ -27,16 +28,6 @@ from logging_setup import logger
 from storage.common import atomic_write_json
 from tg.api import send_telegram_message
 from tg.handlers import handle_message
-
-
-def _log_task_exception(task):
-    """背景訊息任務的完成回呼：把未捕捉的例外記進 log，避免訊息處理崩潰被靜默吞掉。"""
-    try:
-        exc = task.exception()
-    except asyncio.CancelledError:
-        return
-    if exc:
-        logger.error(f"⚠️ 訊息處理任務未捕捉的例外: {redact(exc)}")
 
 
 def _load_telegram_offset() -> int:
@@ -79,13 +70,22 @@ async def telegram_bot_loop():
             
             if response.get("ok"):
                 for update in response.get("result", []):
-                    offset = update["update_id"] + 1
                     message = update.get("message")
                     if message and ("text" in message or "photo" in message
                                     or "voice" in message or "audio" in message):
-                        task = asyncio.create_task(handle_message(message))
-                        task.add_done_callback(_log_task_exception)
-                if response.get("result"):
+                        # at-least-once：處理完成才推進 offset。若中途 crash／重啟，offset 未推進，
+                        # Telegram 會重送此 update（寧可極少數重做，也不靜默漏掉記施肥/收成等訊息）。
+                        # wait_for 逾時保險：handler 卡死時放棄該則並照常推進，避免毒訊息卡住整個輪詢。
+                        try:
+                            await asyncio.wait_for(handle_message(message), timeout=300)
+                        except asyncio.TimeoutError:
+                            logger.error(f"⚠️ handle_message 逾時(>300s)，跳過 update {update['update_id']}")
+                        except Exception as e:
+                            logger.error(f"⚠️ handle_message 例外: {redact(e)}")
+                    # 不論該則是否需處理，都推進到此 update（已處理／已略過／已放棄）。
+                    # 必須同時推進「記憶體中的 offset」——下一次 getUpdates 用的是它，
+                    # 只寫檔不更新變數會讓 getUpdates 一直重抓同一批 → 無限迴圈。
+                    offset = update["update_id"] + 1
                     try:
                         atomic_write_json(TELEGRAM_OFFSET_FILE, {"offset": offset})
                     except Exception as off_err:

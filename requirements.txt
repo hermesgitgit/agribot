@@ -1,0 +1,9 @@
+# 釘版以求部署可重現（值為 2026-06-27 當時的最新版）。
+# ⚠️ playwright 版本必須與 Dockerfile 的 base image 標籤完全一致（v1.60.0-jammy）——
+#    瀏覽器二進位烤在 base image 裡，版本不符會壞；升級時兩處一起改。
+# 註：這只鎖「直接依賴」；要連 transitive 一起鎖死，可在跑得動的容器內：
+#     docker exec <container> pip freeze > requirements.lock
+google-genai==2.10.0
+requests==2.34.2
+playwright==1.60.0
+pillow==12.2.0

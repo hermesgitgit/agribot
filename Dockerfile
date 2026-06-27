@@ -6,7 +6,9 @@ WORKDIR /app
 
 # 先複製並安裝所需套件 (這樣 Docker 可以快取這一步驟)
 # Playwright 本身的瀏覽器已經內建在這個官方 image 中，不用再次下載
-RUN pip install google-genai requests playwright==1.60.0 pillow
+# 依賴釘版集中在 requirements.txt（playwright 版本須與上方 base image 一致）
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 將程式複製進容器：頂層模組 + 六個套件目錄
 # （data/、*.bak、.env 由 .dockerignore 排除，不會被烤進映像檔）

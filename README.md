@@ -4,6 +4,10 @@
 
 agribot pairs a **deterministic science layer** with an **LLM interpreter**: physical quantities — growing degree days, reference evapotranspiration, disease pressure — are computed by pure, auditable functions, and Google Gemini is used only to *interpret* those numbers, converse, and ground its advice in an official agricultural knowledge base — never to invent the numbers itself.
 
+## Architecture
+
+![agribot 架構圖](docs/architecture.svg)
+
 ## What it does
 
 **Sensing & data**
