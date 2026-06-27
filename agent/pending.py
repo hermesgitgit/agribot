@@ -27,6 +27,7 @@
 #      沉默絕不能變成資料默默遺失）。
 # 確認的攔截邏輯在 tg/handlers.py 的訊息入口；逾時落檔在 watchdog_loop 的 sweep。
 import contextvars
+import threading
 import time
 
 from logging_setup import logger
@@ -35,6 +36,10 @@ from storage.harvest import record_harvest
 
 PENDING_EVENTS = {}  # chat_id -> {"type": "harvest"/"fertilizer", "note": str, "created_epoch": float}
 PENDING_EVENT_TTL = 600  # 確認窗 10 分鐘：期間可喊停，逾時視為默認同意自動落檔
+# 保護 PENDING_EVENTS：確認(commit)、取消(clear)、逾時 sweep、AI 登記(set) 可能來自
+# 不同執行緒（asyncio task / to_thread 工具 / watchdog 執行緒）。鎖讓「認領事件」
+# （get+pop）成為原子操作，確保同一筆事件只會被一條路徑落檔一次，落檔本身在鎖外執行。
+_pending_lock = threading.Lock()
 
 # 當前正在處理訊息的 chat_id，供 AFC 工具回寫待確認槽使用。
 # 使用 contextvars 而非普通全域變數：訊息以 asyncio.create_task 併發處理，
@@ -59,17 +64,18 @@ def _set_pending_event(chat_id, ev_type, note):
     不覆蓋——保留先發起的事件,避免「你以為在確認 A、實際確認到 B」的張冠李戴。
     回傳 True 表示成功登記,False 表示因已有未決事件而被擱置。
     """
-    existing = PENDING_EVENTS.get(chat_id)  # 直查字典：已逾時待自動落檔者同樣不可覆蓋
-    if existing:
-        logger.warning(f"⚠️ [Pending Event] 對話 {chat_id} 已有未決的「{existing['type']}」確認，"
-                       f"本次「{ev_type}」登記暫不覆蓋,待前者處理後再試。")
-        return False
-    PENDING_EVENTS[chat_id] = {
-        "type": ev_type,
-        "note": note,
-        "created_epoch": time.time(),
-    }
-    return True
+    with _pending_lock:
+        existing = PENDING_EVENTS.get(chat_id)  # 直查字典：已逾時待自動落檔者同樣不可覆蓋
+        if existing:
+            logger.warning(f"⚠️ [Pending Event] 對話 {chat_id} 已有未決的「{existing['type']}」確認，"
+                           f"本次「{ev_type}」登記暫不覆蓋,待前者處理後再試。")
+            return False
+        PENDING_EVENTS[chat_id] = {
+            "type": ev_type,
+            "note": note,
+            "created_epoch": time.time(),
+        }
+        return True
 
 
 def get_pending_event(chat_id):
@@ -84,7 +90,8 @@ def get_pending_event(chat_id):
 
 
 def clear_pending_event(chat_id):
-    PENDING_EVENTS.pop(chat_id, None)
+    with _pending_lock:
+        PENDING_EVENTS.pop(chat_id, None)
 
 
 def _apply_pending_event(ev) -> str:
@@ -108,10 +115,11 @@ def commit_pending_event(chat_id) -> str:
     """將待確認事件實際落檔。回傳結果訊息（無事件可落檔時回空字串）。
     直接以 pop 取走字典中的事件（即使剛逾時也照常落檔），
     避免「明確確認與逾時擦肩」的競態造成漏記或重複記。"""
-    ev = PENDING_EVENTS.pop(chat_id, None)
+    with _pending_lock:  # 原子認領：與 sweep／cancel 互斥，確保只有一條路徑拿到此事件
+        ev = PENDING_EVENTS.pop(chat_id, None)
     if not ev:
         return ""
-    return _apply_pending_event(ev)
+    return _apply_pending_event(ev)  # 落檔在鎖外做（不在持鎖時做 DB I/O）
 
 
 def sweep_expired_pending_events() -> list:
@@ -124,12 +132,17 @@ def sweep_expired_pending_events() -> list:
     results = []
     now_epoch = time.time()
     for cid in list(PENDING_EVENTS.keys()):
-        ev = PENDING_EVENTS.get(cid)
-        if not ev or now_epoch - ev["created_epoch"] <= PENDING_EVENT_TTL:
+        # 原子認領：在鎖內判斷逾時並 pop，確保不會與使用者同時確認/取消擦肩而重複落檔。
+        with _pending_lock:
+            ev = PENDING_EVENTS.get(cid)
+            if not ev or now_epoch - ev["created_epoch"] <= PENDING_EVENT_TTL:
+                ev = None
+            else:
+                PENDING_EVENTS.pop(cid, None)
+        if not ev:
             continue
-        PENDING_EVENTS.pop(cid, None)
         try:
-            msg = _apply_pending_event(ev)
+            msg = _apply_pending_event(ev)  # 落檔在鎖外做
             results.append((cid, f"⏱️ 確認窗已逾時，依預設為您自動完成：\n{msg}"))
             logger.info(f"⏱️ [Pending Event] 逾時默認同意，已自動處理 {ev['type']} (chat_id={cid})。")
         except Exception as e:

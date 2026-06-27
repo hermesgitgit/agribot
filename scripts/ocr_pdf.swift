@@ -1,6 +1,10 @@
 // PDF → 繁中 OCR 文字（macOS 內建 PDFKit + Vision，離線、零外部依賴）
 // 用法：ocr_pdf <pdf路徑>
 // 輸出：每頁以 "\f<頁碼>\f" 分隔的純文字到 stdout（供 Python 切塊建索引）
+//
+// 建置（macOS）：swiftc -O scripts/ocr_pdf.swift -o scripts/ocr_pdf
+// 註：編譯出的 ocr_pdf 是 macOS 專用二進位、已被 .gitignore；僅本機建知識庫時用，
+//     不進容器（容器用預建好的 knowledge.db）。換機或更新時用上面指令重新編譯。
 import Foundation
 import PDFKit
 import Vision

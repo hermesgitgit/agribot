@@ -29,6 +29,16 @@ from tg.api import send_telegram_message
 from tg.handlers import handle_message
 
 
+def _log_task_exception(task):
+    """背景訊息任務的完成回呼：把未捕捉的例外記進 log，避免訊息處理崩潰被靜默吞掉。"""
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc:
+        logger.error(f"⚠️ 訊息處理任務未捕捉的例外: {redact(exc)}")
+
+
 def _load_telegram_offset() -> int:
     """讀取上次已確認的 Telegram update offset；無檔案或毀損時回 0。"""
     try:
@@ -73,7 +83,8 @@ async def telegram_bot_loop():
                     message = update.get("message")
                     if message and ("text" in message or "photo" in message
                                     or "voice" in message or "audio" in message):
-                        asyncio.create_task(handle_message(message))
+                        task = asyncio.create_task(handle_message(message))
+                        task.add_done_callback(_log_task_exception)
                 if response.get("result"):
                     try:
                         atomic_write_json(TELEGRAM_OFFSET_FILE, {"offset": offset})

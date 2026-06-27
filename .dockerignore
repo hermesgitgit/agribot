@@ -7,8 +7,18 @@ baseline_names.txt
 import_test.sh
 # 祕密
 .env
+.env.*
+*.secret
 # 版控與作業系統中繼資料：不該進 build context（.git 會隨每次部署快照長大、拖慢 build）
 .git/
-@eaDir/
+.gitignore
 __pycache__/
+*.pyc
 .DS_Store
+# Synology Drive / NAS 同步中繼資料
+.SynologyWorkingDirectory/
+@eaDir/
+*.SynoEAStream
+*.SynoResource
+# macOS 專用編譯產物（容器用不到）
+scripts/ocr_pdf

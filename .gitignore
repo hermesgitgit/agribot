@@ -22,6 +22,10 @@ __pycache__/
 *.log
 *.bak
 
+# ---- 編譯產物（由原始碼建置，不進版控）----
+# ocr_pdf 是 macOS 專用 Mach-O，僅供本機建知識庫用；由 ocr_pdf.swift 編譯而來。
+scripts/ocr_pdf
+
 # ---- 作業系統 / 編輯器雜物 ----
 .DS_Store
 *.swp

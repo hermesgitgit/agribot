@@ -34,7 +34,8 @@ def save_photo(image_bytes) -> str:
     """
     os.makedirs(PHOTO_DIR, exist_ok=True)
 
-    timestamp = datetime.datetime.now(TZ_TAIPEI).strftime("%Y%m%d_%H%M%S")
+    # 微秒精度檔名：避免同一秒內連續上傳互相覆寫；仍可字典序＝時間序。
+    timestamp = datetime.datetime.now(TZ_TAIPEI).strftime("%Y%m%d_%H%M%S_%f")
     new_filepath = os.path.join(PHOTO_DIR, f"{timestamp}.jpg")
 
     try:
@@ -59,6 +60,17 @@ def save_photo(image_bytes) -> str:
         return ""
 
 
+def _parse_photo_dt(basename):
+    """從相片檔名解析時間；同時相容新（微秒）與舊（秒）兩種格式。失敗回 None。"""
+    stem = basename.split(".")[0]
+    for fmt in ("%Y%m%d_%H%M%S_%f", "%Y%m%d_%H%M%S"):
+        try:
+            return datetime.datetime.strptime(stem, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def get_past_photo(current_photo_path: str) -> str:
     """
     在照片目錄中檢索「至少 4 天前、至多 14 天前」的歷史照片。
@@ -77,24 +89,21 @@ def get_past_photo(current_photo_path: str) -> str:
 
     # 解析當前照片的時間
     current_basename = os.path.basename(current_photo_path)
-    try:
-        current_dt = datetime.datetime.strptime(current_basename.split(".")[0], "%Y%m%d_%H%M%S")
-    except Exception:
+    current_dt = _parse_photo_dt(current_basename)
+    if current_dt is None:
         # 若當前檔名無法解析，直接返回最舊的一張
         return other_photos[0]
 
     best_match = None
     # 尋找「至少 4 天前、至多 14 天前」的照片
     for p in reversed(other_photos):
-        base = os.path.basename(p)
-        try:
-            p_dt = datetime.datetime.strptime(base.split(".")[0], "%Y%m%d_%H%M%S")
-            diff_days = (current_dt - p_dt).total_seconds() / 86400.0
-            if 4.0 <= diff_days <= 14.0:
-                best_match = p
-                break
-        except Exception:
+        p_dt = _parse_photo_dt(os.path.basename(p))
+        if p_dt is None:
             continue
+        diff_days = (current_dt - p_dt).total_seconds() / 86400.0
+        if 4.0 <= diff_days <= 14.0:
+            best_match = p
+            break
 
     if best_match:
         logger.info(f"🎞️ [Photo Manager] 找到完美的對照組歷史照片（差距 {diff_days:.1f} 天）: {best_match}")
@@ -111,8 +120,9 @@ def get_photo_staleness_days():
         photos = sorted(glob.glob(os.path.join(PHOTO_DIR, "*.jpg")))
         if not photos:
             return None
-        newest = os.path.basename(photos[-1]).replace(".jpg", "")
-        dt = datetime.datetime.strptime(newest, "%Y%m%d_%H%M%S")
+        dt = _parse_photo_dt(os.path.basename(photos[-1]))  # 相容新(微秒)/舊(秒)檔名
+        if dt is None:
+            return None
         dt = dt.replace(tzinfo=TZ_TAIPEI)
         return max(0, (datetime.datetime.now(TZ_TAIPEI) - dt).days)
     except Exception:

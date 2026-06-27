@@ -32,6 +32,7 @@ from logging_setup import logger
 AGRI_API_KEY = os.getenv("AGRI_API_KEY")
 AGRI_SUID = os.getenv("AGRI_SUID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")  # 報告備援（Gemini 壅塞時改打 NVIDIA），選填
 AGRI_USERNAME = os.getenv("AGRI_USERNAME")
 AGRI_PASSWORD = os.getenv("AGRI_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -90,7 +91,7 @@ def redact(text) -> str:
     /app/data/logs/ 長期留存。
     """
     s = str(text)
-    for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY, AGRI_PASSWORD, AGRI_API_KEY, CWA_API_KEY, HEARTBEAT_URL):
+    for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, AGRI_PASSWORD, AGRI_API_KEY, CWA_API_KEY, HEARTBEAT_URL):
         if secret:
             s = s.replace(secret, "***")
     return s

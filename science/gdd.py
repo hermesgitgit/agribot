@@ -57,8 +57,11 @@ def match_crop_key(crop_name: str):
     比對不到時回傳原名（以自訂名稱用預設參數註冊）。
     供作物切換路徑（AI 工具 / /crop 指令）使用。
     """
+    if not crop_name or not crop_name.strip():
+        return crop_name  # 空作物名：直接回傳，避免 split()[0] IndexError
+    first = crop_name.split()[0]
     for k in CROP_GDD_DATABASE.keys():
-        if crop_name.split()[0] in k or k.split()[0] in crop_name:
+        if first in k or k.split()[0] in crop_name:
             return k
     return crop_name
 
@@ -71,9 +74,11 @@ def lookup_crop_info(crop_name: str):
     info = CROP_GDD_DATABASE.get(crop_name)
     if info:
         return crop_name, info
-    for k, v in CROP_GDD_DATABASE.items():
-        if crop_name.split()[0] in k or k.split()[0] in crop_name:
-            return k, v
+    if crop_name and crop_name.strip():  # 空作物名跳過模糊比對，避免 split()[0] IndexError
+        first = crop_name.split()[0]
+        for k, v in CROP_GDD_DATABASE.items():
+            if first in k or k.split()[0] in crop_name:
+                return k, v
     return DEFAULT_CROP_KEY, CROP_GDD_DATABASE[DEFAULT_CROP_KEY]
 
 

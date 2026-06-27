@@ -24,6 +24,9 @@ import requests
 from config import TELEGRAM_TOKEN, redact
 from logging_setup import logger
 
+# 下載檔案大小上限（Telegram bot 下載上限約 20MB，照片遠小於此）。防爆記憶體。
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
 
 # ======================================================================
 # 耕地狀況快捷按鍵 (Reply Keyboard)
@@ -75,7 +78,7 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
                 r = await loop.run_in_executor(
                     None, lambda p=plain: requests.post(url, json=p, timeout=10))
             if r.status_code != 200:
-                logger.warning(f"⚠️ 發送 Telegram 失敗: {r.status_code}, {r.text}")
+                logger.warning(f"⚠️ 發送 Telegram 失敗: {r.status_code}, {redact(r.text)}")
         except Exception as e:
             logger.warning(f"⚠️ 發送 Telegram 網路錯誤: {redact(e)}")
 
@@ -106,12 +109,18 @@ async def download_telegram_photo(file_id) -> bytes:
             lambda: requests.get(get_file_url, params={"file_id": file_id}, timeout=10)
         )
         if res.status_code != 200:
-            logger.warning(f"⚠️ 取得 Telegram 檔案路徑失敗: {res.status_code}, {res.text}")
+            logger.warning(f"⚠️ 取得 Telegram 檔案路徑失敗: {res.status_code}, {redact(res.text)}")
             return None
 
         file_info = res.json()
         if not file_info.get("ok"):
             logger.warning(f"⚠️ Telegram getFile 回傳 ok=False: {file_info}")
+            return None
+
+        # 防呆：下載前先用 getFile 回報的大小擋掉過大檔案（避免吃爆記憶體）。
+        file_size = file_info["result"].get("file_size") or 0
+        if file_size and file_size > MAX_DOWNLOAD_BYTES:
+            logger.warning(f"⚠️ 檔案過大（{file_size} bytes > {MAX_DOWNLOAD_BYTES}），拒絕下載。")
             return None
 
         file_path = file_info["result"]["file_path"]
@@ -126,7 +135,11 @@ async def download_telegram_photo(file_id) -> bytes:
             logger.warning(f"⚠️ 下載 Telegram 圖片失敗: {file_res.status_code}")
             return None
 
-        return file_res.content
+        content = file_res.content
+        if len(content) > MAX_DOWNLOAD_BYTES:  # 後備：getFile 沒給 size 時擋下載結果
+            logger.warning(f"⚠️ 下載內容過大（{len(content)} bytes），丟棄。")
+            return None
+        return content
     except Exception as e:
         logger.warning(f"⚠️ 下載 Telegram 檔案時出錯: {redact(e)}")
         return None

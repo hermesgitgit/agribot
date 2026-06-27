@@ -26,6 +26,10 @@ import re
 
 from PIL import Image
 
+# 明確的解壓炸彈守門：超過此像素數的圖在 load() 時會丟 DecompressionBombError
+# （Pillow 預設約 89MP；這裡收緊到對手機/Telegram 壓縮照足夠的 50MP）。
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
 from agent.guard import (
     MAX_THRESHOLD_STEP, apply_crop_command, apply_threshold_command, strip_links,
 )
@@ -36,7 +40,6 @@ from agent.pending import (
 from agent.prompts import build_kb_context, build_state_summary, get_current_time_context
 from agent.session import (
     get_chat_lock, get_or_create_chat, is_session_fresh, reset_chat, send_message_with_retry,
-    transcribe_voice,
 )
 from config import HEARTBEAT_FILE, HEARTBEAT_URL, TELEGRAM_CHAT_ID, redact
 from logging_setup import logger
@@ -300,23 +303,10 @@ async def handle_message(message):
         logger.info(f"🔒 已靜默忽略未授權的對話請求。Chat ID: {chat_id}")
         return
 
-    # 🎤 語音訊息：先用 Gemini 轉成文字，之後一律當「使用者打的字」跑既有流程，
-    # 既有功能（查狀況、記施肥/收成、問澆水…）語音全可用。適合田裡髒手濕手按住說。
-    voice = message.get("voice") or message.get("audio")
-    if voice and not photo and not text:
-        await send_typing_action(chat_id)
-        audio_bytes = await download_telegram_photo(voice["file_id"])  # 同一支下載函式，內容不限照片
-        if not audio_bytes:
-            await send_telegram_message(chat_id, "⚠️ 語音下載失敗，請再說一次或改用打字。")
-            return
-        transcript = await asyncio.to_thread(
-            transcribe_voice, audio_bytes, voice.get("mime_type", "audio/ogg"))
-        if not transcript:
-            await send_telegram_message(chat_id, "⚠️ 這段語音我沒聽清楚，請靠近一點再說一次，或改用打字。")
-            return
-        # 回放聽到的內容，讓你一眼確認沒誤解（誤聽可立刻再說；記施肥/收成另有確認制把關）
-        await send_telegram_message(chat_id, f"🎤 我聽到的是：「{transcript}」")
-        text = transcript  # 之後流程與打字完全一致
+    # 🎤 語音輸入已停用（轉錄品質不穩、易誤觸發操作）。收到語音就請對方改用打字。
+    if (message.get("voice") or message.get("audio")) and not photo and not text:
+        await send_telegram_message(chat_id, "🎤 語音功能已停用，請改用打字告訴我（查狀況、記施肥/收成、問澆水…都可以）。")
+        return
 
     user_input_text = caption if photo else text
 
@@ -407,22 +397,29 @@ async def handle_message(message):
             file_id = photo[-1]["file_id"]  # 取得最高解析度的照片
             image_bytes = await download_telegram_photo(file_id)
             if image_bytes:
-                # 儲存當前照片到 NAS
-                current_photo_path = save_photo(image_bytes)
+                # 先在記憶體解碼驗證（含 MAX_IMAGE_PIXELS 守門），通過才落檔到 NAS，
+                # 避免把損毀／超大的惡意圖先寫進磁碟。
                 try:
                     pil_image = Image.open(io.BytesIO(image_bytes))
-                    logger.info("🖼️ 成功下載最新照片並載入為 PIL Image。")
-                    
+                    pil_image.load()
+                except Exception as img_err:
+                    pil_image = None
+                    logger.warning(f"⚠️ 解析當下圖片失敗，不存檔: {img_err}")
+                    await send_telegram_message(chat_id, "⚠️ 這張圖片我無法解析，請換一張，或直接用文字描述狀況。")
+
+                if pil_image is not None:
+                    current_photo_path = save_photo(image_bytes)
+                    logger.info("🖼️ 成功下載並驗證最新照片。")
                     # 嘗試抓取一週前的對照歷史照片
                     past_photo_path = get_past_photo(current_photo_path)
                     if past_photo_path:
                         try:
                             past_pil_image = Image.open(past_photo_path)
+                            past_pil_image.load()
                             logger.info("🖼️ 成功載入歷史照片作為對照組。")
                         except Exception as past_err:
+                            past_pil_image = None
                             logger.warning(f"⚠️ 載入歷史照片失敗: {past_err}")
-                except Exception as img_err:
-                    logger.warning(f"⚠️ 解析當下圖片失敗: {img_err}")
             else:
                 await send_telegram_message(chat_id, "⚠️ 圖片下載失敗，系統將僅根據數據和文字進行分析。")
 

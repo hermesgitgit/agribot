@@ -30,8 +30,9 @@ from agent.prompts import (
     has_severe_weather, parse_sensor_block,
 )
 from science.disease import format_disease_report
-from agent.session import generate_oneshot_no_tools, generate_oneshot_with_retry
-from config import TELEGRAM_CHAT_ID
+from agent.session import generate_oneshot_no_tools, generate_oneshot_with_retry, is_transient_api_error
+from agent.nvidia_fallback import generate_report_text
+from config import TELEGRAM_CHAT_ID, redact
 from logging_setup import logger
 from scrapers.agri import get_agriweather_data
 from scrapers.cwa import fetch_cwa_observation, get_cwa_weather_forecast
@@ -231,5 +232,18 @@ async def hourly_safety_check_loop():
                 logger.info("✅ [Sentinel] 緊急預警推播成功發送。")
                 
         except Exception as e:
-            logger.warning(f"⚠️ [Sentinel] 安全巡檢迴圈發生異常，將在 60 秒後重試: {e}")
+            logger.warning(f"⚠️ [Sentinel] 安全巡檢迴圈發生異常，將在 60 秒後重試: {redact(e)}")
+            # Gemini 壅塞耗盡導致緊急警報生不出來 → 用備援模型補發（警報最不容遺漏）。
+            fb_prompt = locals().get('prompt')
+            fb_chat = locals().get('chat_id')
+            if is_transient_api_error(e) and fb_prompt and fb_chat:
+                logger.warning("⚠️ [Sentinel] Gemini 壅塞耗盡，改用備援模型(gpt-oss-120b)補發緊急警報…")
+                fb_text = await asyncio.to_thread(generate_report_text, fb_prompt)
+                if fb_text:
+                    # 降級模式：只清連結，不套用任何閉環控制指令。
+                    fb_text = strip_links(fb_text, source_tag="哨兵(備援)")
+                    fb_text = "🛟（Gemini 暫時壅塞，本則緊急警報由備援模型生成）\n\n" + fb_text
+                    await send_telegram_message(fb_chat, fb_text)
+                    record_push("緊急安全警報(備援)", fb_text)
+                    logger.info("✅ [Sentinel] 已用備援模型補發緊急警報。")
             sentinel_sleep = 60
