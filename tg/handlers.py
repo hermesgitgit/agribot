@@ -39,8 +39,10 @@ from agent.pending import (
 )
 from agent.prompts import build_kb_context, build_state_summary, get_current_time_context
 from agent.session import (
-    get_chat_lock, get_or_create_chat, is_session_fresh, reset_chat, send_message_with_retry,
+    get_chat_lock, get_or_create_chat, is_session_fresh, is_transient_api_error,
+    reset_chat, send_message_with_retry,
 )
+from agent.nvidia_fallback import generate_report_text
 from config import HEARTBEAT_FILE, HEARTBEAT_URL, TELEGRAM_CHAT_ID, redact
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE, lookup_crop_info
@@ -289,6 +291,11 @@ async def handle_local_command(chat_id, text) -> bool:
     return False  # 未知指令交由 AI 處理
 
 
+def _text_only_prompt(prompt_parts):
+    """從多模態 prompt_parts 取出純文字部分，供文字備援模型使用（它吃不了圖片）。"""
+    return "\n\n".join(p for p in prompt_parts if isinstance(p, str)).strip()
+
+
 async def handle_message(message):
     chat_id = message["chat"]["id"]
     text = message.get("text", "").strip()
@@ -507,20 +514,39 @@ async def handle_message(message):
         # 新 SDK 在「本輪無文字回應」時 .text 回 None（舊版是拋例外）——
         # 必須擋下，否則 None 流進後續清洗鏈會炸 TypeError。空回覆誠實告知。
         ai_message = (response.text or "").strip()
-        if not ai_message:
-            ai_message = "（這一輪我沒有成功產生文字回覆，請再說一次或換個說法試試。）"
-        
-        # 4. & 5. 閉環控制指令：統一經過 Command Guard 驗證後套用
-        ai_message = apply_threshold_command(ai_message, source_tag="對話")
-        ai_message = apply_crop_command(ai_message, source_tag="對話")
-        ai_message = strip_links(ai_message, source_tag="對話")
+        if ai_message:
+            # 4. & 5. 閉環控制指令：統一經過 Command Guard 驗證後套用
+            ai_message = apply_threshold_command(ai_message, source_tag="對話")
+            ai_message = apply_crop_command(ai_message, source_tag="對話")
+            ai_message = strip_links(ai_message, source_tag="對話")
+        else:
+            # Gemini 本輪沒產出文字（常是呼叫了工具卻漏寫報告）→ 改用備援模型以純文字重產。
+            # 降級模式：只清連結、不套用任何閉環控制指令（不讓備援模型改門檻/作物）。
+            tp = _text_only_prompt(prompt_parts)
+            fb = await asyncio.to_thread(generate_report_text, tp) if tp else ""
+            ai_message = (
+                "🛟（Gemini 未能生成，改用備援模型）\n\n" + strip_links(fb, source_tag="對話備援")
+            ) if fb else "（這一輪我沒有成功產生文字回覆，請再說一次或換個說法試試。）"
 
         logger.info(f"🤖 Gemini 回覆:\n{ai_message}")
         await send_telegram_message(chat_id, ai_message)
 
     except Exception as e:
         logger.error(f"❌ 處理 Gemini 訊息失敗: {redact(e)}")
-        await send_telegram_message(chat_id, f"❌ 系統分析時發生錯誤，請稍後再試。錯誤描述：{redact(e)}")
+        # Gemini 壅塞耗盡（503/429）→ 也試備援模型，避免互動分析整個失敗
+        fb = ""
+        pp = locals().get('prompt_parts')
+        if is_transient_api_error(e) and pp:
+            tp = _text_only_prompt(pp)
+            if tp:
+                try:
+                    fb = await asyncio.to_thread(generate_report_text, tp)
+                except Exception as fb_err:
+                    logger.warning(f"⚠️ 對話備援也失敗: {redact(fb_err)}")
+        if fb:
+            await send_telegram_message(chat_id, "🛟（Gemini 暫時壅塞，改用備援模型）\n\n" + strip_links(fb, source_tag="對話備援"))
+        else:
+            await send_telegram_message(chat_id, "❌ 系統分析暫時失敗（Gemini 忙線），請稍後再試。")
     finally:
         keep_typing = False
         typing_task.cancel()
