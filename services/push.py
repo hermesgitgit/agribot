@@ -33,6 +33,7 @@ from agent.session import (
     generate_oneshot_with_retry, is_transient_api_error,
 )
 from agent.nvidia_fallback import generate_report_text
+from agent.resilience import generate_report_resilient
 from agent.tools import tool_record_prediction
 from config import TELEGRAM_CHAT_ID, now_taipei, redact
 from logging_setup import logger
@@ -51,6 +52,7 @@ from tg.api import send_telegram_message
 async def trigger_scheduled_push():
     chat_id = int(TELEGRAM_CHAT_ID)
     # 定時推播改用無狀態 Gemini 呼叫（每次自帶完整數據，無需對話記憶）
+    report_sent = False  # 報告是否已送出——決定錯誤發生時要不要啟動備援（避免報告已送還重送）
         
     try:
         # 定時推播一律發動併行爬取以取得最新現場與預報數據
@@ -136,7 +138,11 @@ async def trigger_scheduled_push():
         )
         
         logger.info("⏰ [Scheduled] 正在調用 Gemini 進行定時自動分析 (無狀態一次性呼叫)...")
-        response = await asyncio.to_thread(generate_oneshot_with_retry, prompt)
+        # 帶工具產報告；非壅塞性崩潰（如模型亂叫工具名→AFC KeyError）→ 退無工具純文字重產；
+        # 壅塞性錯誤則往外拋，由外層備援模型接手。
+        response = await asyncio.to_thread(
+            generate_report_resilient, prompt,
+            generate_oneshot_with_retry, generate_oneshot_no_tools, is_transient_api_error)
         ai_message = (response.text or "").strip()
         
         # 防呆：若回應過短或缺標題（疑似模型跑去呼叫工具而漏掉報告本體），
@@ -165,6 +171,7 @@ async def trigger_scheduled_push():
 
         logger.info("🤖 [Scheduled] Gemini 定時分析完成，正在推送至 Telegram...")
         await send_telegram_message(chat_id, ai_message)
+        report_sent = True
         record_push("定時農務推播", ai_message)
 
         # 報告送出後，另起一次「只負責登記預測」的聚焦呼叫，驅動自我校正迴路。
@@ -176,28 +183,27 @@ async def trigger_scheduled_push():
 
     except Exception as e:
         logger.error(f"❌ [Scheduled] 定時自動分析推送失敗: {redact(e)}")
-        if is_transient_api_error(e):
-            # Gemini 暫時壅塞（429/5xx）且重試已耗盡 → 最後一道安全網：改用備援模型
-            # 以純文字、同一份 prompt 再產一次報告（資料都已在 prompt 裡）。
-            fb_prompt = locals().get('prompt')
-            fb_text = ''
-            if fb_prompt:
-                logger.warning("⚠️ [Scheduled] Gemini 壅塞耗盡，改用備援模型(gpt-oss-120b)產報告…")
-                fb_text = await asyncio.to_thread(generate_report_text, fb_prompt)
-            if fb_text:
-                # 備援為降級模式：只清掉連結，不套用任何閉環控制指令（不讓較弱模型改門檻/作物）。
-                fb_text = strip_links(fb_text, source_tag="定時推播(備援)")
-                fb_text = "🛟 <i>（Gemini 暫時壅塞，本則由備援模型生成）</i>\n\n" + fb_text
-                await send_telegram_message(chat_id, fb_text)
-                record_push("定時農務推播(備援)", fb_text)
-                logger.info("✅ [Scheduled] 已用備援模型完成定時分析推送。")
-            else:
-                await send_telegram_message(chat_id, (
-                    "⚠️ 本時段的定時農務分析未能完成：Gemini 服務暫時壅塞（已自動重試仍未恢復），備援亦無法生成。\n"
-                    "不影響感測數據記錄，下一個排程時段會自動恢復推播；"
-                    "急需分析可稍後直接對我提問。"))
+        if report_sent:
+            # 報告已送出，錯誤出在事後步驟（如預測登記，另有自保）→ 只記 log，不重送。
+            return
+        # 主報告尚未送出——不論是壅塞、或帶工具呼叫崩潰等任何原因，啟動最後一道安全網：
+        # 用備援模型以純文字、同一份 prompt 再產一次（資料都已在 prompt 裡，純文字即可）。
+        fb_prompt = locals().get('prompt')
+        fb_text = ''
+        if fb_prompt:
+            logger.warning("⚠️ [Scheduled] 主報告未送出，改用備援模型(gpt-oss-120b)產報告…")
+            fb_text = await asyncio.to_thread(generate_report_text, fb_prompt)
+        if fb_text:
+            # 備援為降級模式：只清掉連結，不套用任何閉環控制指令（不讓較弱模型改門檻/作物）。
+            fb_text = strip_links(fb_text, source_tag="定時推播(備援)")
+            fb_text = "🛟 <i>（主分析未能完成，本則由備援模型生成）</i>\n\n" + fb_text
+            await send_telegram_message(chat_id, fb_text)
+            record_push("定時農務推播(備援)", fb_text)
+            logger.info("✅ [Scheduled] 已用備援模型完成定時分析推送。")
         else:
-            await send_telegram_message(chat_id, f"❌ 系統定時自動分析時發生錯誤：{redact(e)}")
+            await send_telegram_message(chat_id, (
+                "⚠️ 本時段的定時農務分析未能完成（已自動重試與備援仍未成功）。\n"
+                "不影響感測數據記錄，下一個排程時段會自動恢復推播；急需分析可稍後直接對我提問。"))
 
 
 async def _register_daily_prediction(state_summary, sensor_display, weather_forecast, prediction_feedback):

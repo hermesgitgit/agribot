@@ -257,6 +257,37 @@ def test_kb_context():
     os.unlink(db)
 
 
+def test_report_resilience():
+    section("generate_report_resilient（帶工具崩潰→無工具重產）")
+    from agent.resilience import generate_report_resilient
+
+    class Resp:
+        def __init__(self, t):
+            self.text = t
+
+    def boom(p):
+        raise KeyError("record_prediction")  # 模擬模型亂叫工具名 → AFC KeyError
+
+    # 1) 帶工具成功 → 直接用它、不退無工具
+    r = generate_report_resilient("p",
+                                  lambda p: Resp("帶工具報告"),
+                                  lambda p: Resp("無工具報告"),
+                                  lambda e: False)
+    check("帶工具成功時用帶工具結果", r.text == "帶工具報告")
+
+    # 2) 帶工具非壅塞崩潰（KeyError）→ 退到無工具重產（不整輪陣亡）
+    r2 = generate_report_resilient("p", boom, lambda p: Resp("無工具報告"), lambda e: False)
+    check("帶工具崩潰(非壅塞)→退無工具重產", r2.text == "無工具報告")
+
+    # 3) 帶工具壅塞崩潰 → 往外拋（交備援），不被吞掉
+    raised = False
+    try:
+        generate_report_resilient("p", boom, lambda p: Resp("不該用到"), lambda e: True)
+    except KeyError:
+        raised = True
+    check("帶工具壅塞崩潰→往外拋交備援", raised)
+
+
 # ======================================================================
 # 需要問 Gemini 才驗得出來的行為（手動清單，尚未自動化）
 # 這些靠 SYSTEM_INSTRUCTION 的自由文字行為，本機純邏輯驗不出，要實際呼叫模型。
@@ -312,6 +343,7 @@ def main():
     test_disease_knowledge_link()
     test_recent_rain()
     test_kb_context()
+    test_report_resilience()
     print_model_checklist()
     print(f"\n===== 結果：{_PASS} 通過 / {_FAIL} 失敗 =====")
     sys.exit(1 if _FAIL else 0)

@@ -47,6 +47,14 @@ if not all([GEMINI_API_KEY, AGRI_API_KEY, AGRI_SUID, TELEGRAM_TOKEN, TELEGRAM_CH
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL")
 
 # ----------------------------------------------------------------------
+# Hermes Agent 橋接端點（選用）：讓同一台 NAS 上的 Hermes 容器可以把農務問題
+# 轉給本系統的既有 AI 對話邏輯處理，答案原文回傳（不經 Telegram）。
+# 未設定 BRIDGE_SHARED_SECRET 時端點停用（bridge/server.py 會直接跳過啟動）。
+# ----------------------------------------------------------------------
+BRIDGE_SHARED_SECRET = os.getenv("BRIDGE_SHARED_SECRET", "").strip()
+BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8765"))
+
+# ----------------------------------------------------------------------
 # CWA 氣象開放資料 API 設定（觀測資料 O-A0001-001）
 # ----------------------------------------------------------------------
 # 用於取得博嘉國小（文山站）的即時實測氣象，作為 ET₀ 虛擬感測器的輸入。
@@ -72,6 +80,7 @@ TELEGRAM_OFFSET_FILE = os.path.join(DATA_DIR, "telegram_offset.json")
 PHOTO_DIR = os.path.join(DATA_DIR, "photos")
 KNOWLEDGE_DB_FILE = os.path.join(DATA_DIR, "knowledge.db")  # 農業部出版品知識庫（離線建置後放入）
 LAST_PUSH_FILE = os.path.join(DATA_DIR, "last_push.json")   # 最近一次主動推播摘要（供對話腦知悉推播腦說過什麼）
+HERMES_OUTBOX_DIR = os.path.join(DATA_DIR, "hermes_outbox") # 主動推播的轉發信箱（Hermes 掛載讀取後刪除；agribot 只寫不讀）
 
 # 全系統一律以台北時區運作，不受容器內部 OS 時區偏差影響
 TZ_TAIPEI = datetime.timezone(datetime.timedelta(hours=8))
@@ -91,7 +100,7 @@ def redact(text) -> str:
     /app/data/logs/ 長期留存。
     """
     s = str(text)
-    for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, AGRI_PASSWORD, AGRI_API_KEY, CWA_API_KEY, HEARTBEAT_URL):
+    for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, AGRI_PASSWORD, AGRI_API_KEY, CWA_API_KEY, HEARTBEAT_URL, BRIDGE_SHARED_SECRET):
         if secret:
             s = s.replace(secret, "***")
     return s

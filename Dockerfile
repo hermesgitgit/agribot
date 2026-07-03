@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 將程式複製進容器：頂層模組 + 六個套件目錄
+# 將程式複製進容器：頂層模組 + 七個套件目錄
 # （data/、*.bak、.env 由 .dockerignore 排除，不會被烤進映像檔）
 COPY *.py /app/
 COPY agent/ /app/agent/
@@ -19,6 +19,7 @@ COPY scrapers/ /app/scrapers/
 COPY services/ /app/services/
 COPY storage/ /app/storage/
 COPY tg/ /app/tg/
+COPY bridge/ /app/bridge/
 
 # 執行腳本（過渡門面，與拆分前的單檔介面完全相同；日後可改為 main.py）
 CMD ["python3", "-u", "agriweather_scraper.py"]

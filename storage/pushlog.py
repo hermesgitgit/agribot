@@ -24,12 +24,36 @@
 # 讓對話腦至少知道推播腦最近說過什麼。
 import json
 import os
+import re
+import time
 
-from config import LAST_PUSH_FILE, now_taipei
+from config import HERMES_OUTBOX_DIR, LAST_PUSH_FILE, now_taipei
 from logging_setup import logger
 from storage.common import STATE_FILE_LOCK, atomic_write_json
 
 _SUMMARY_MAX_CHARS = 600  # 注入 prompt 的摘要長度上限，防止對話 prompt 膨脹
+_OUTBOX_TEXT_MAX_CHARS = 3500  # 轉發全文上限（Hermes 端只做彙整，不需要無限長）
+_OUTBOX_KEEP_MAX = 50          # 信箱滾動上限：Hermes 長期未消化時刪最舊，防無限堆積
+
+
+def _write_hermes_outbox(kind: str, text: str):
+    """把這則主動推播多寫一份到轉發信箱（一則一檔），供 Hermes 讀取後刪除。
+    純附加功能：任何失敗只記 log，絕不影響推播本身與 last_push 記錄。"""
+    try:
+        os.makedirs(HERMES_OUTBOX_DIR, exist_ok=True)
+        safe_kind = re.sub(r"[^\w一-鿿-]", "_", kind)[:40]
+        fname = f"{int(time.time() * 1000)}_{safe_kind}.json"
+        atomic_write_json(os.path.join(HERMES_OUTBOX_DIR, fname), {
+            "ts": now_taipei().strftime("%Y-%m-%d %H:%M"),
+            "kind": kind,
+            "text": (text or "")[:_OUTBOX_TEXT_MAX_CHARS],
+        })
+        # 滾動清理：檔名以 epoch ms 開頭，字典序即時間序
+        entries = sorted(f for f in os.listdir(HERMES_OUTBOX_DIR) if f.endswith(".json"))
+        for old in entries[:-_OUTBOX_KEEP_MAX]:
+            os.remove(os.path.join(HERMES_OUTBOX_DIR, old))
+    except Exception as e:
+        logger.warning(f"⚠️ [Push Log] 寫入 Hermes 轉發信箱失敗（不影響推播）: {e}")
 
 
 def record_push(kind: str, text: str):
@@ -43,6 +67,7 @@ def record_push(kind: str, text: str):
             })
     except Exception as e:
         logger.warning(f"⚠️ [Push Log] 記錄推播摘要失敗: {e}")
+    _write_hermes_outbox(kind, text)
 
 
 def load_last_push_brief() -> str:

@@ -22,6 +22,7 @@
 # 啟動時偵測離線斷層並回報、回補缺漏的 GDD 結算。
 import asyncio
 
+from bridge.server import bridge_server_loop
 from config import TELEGRAM_CHAT_ID
 from logging_setup import logger
 from science.gdd import GDD_BACKFILL_MAX_DAYS
@@ -65,12 +66,15 @@ async def main():
     except Exception as e:
         logger.warning(f"⚠️ [GDD Startup] 啟動時計算 GDD 發生異常: {e}")
 
-    # 併行執行 Telegram 監聽 Bot、定時推送服務、背景安全哨兵巡檢與系統看門狗
+    # 併行執行 Telegram 監聽 Bot、定時推送服務、背景安全哨兵巡檢、系統看門狗，
+    # 與（選用）Hermes Agent 橋接端點。橋接迴圈未設密鑰時會自行提早返回，
+    # 不影響其餘四條既有迴圈。
     await asyncio.gather(
         telegram_bot_loop(),
         scheduled_push_loop(),
         hourly_safety_check_loop(),
-        watchdog_loop()
+        watchdog_loop(),
+        bridge_server_loop(),
     )
 
 

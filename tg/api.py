@@ -18,11 +18,33 @@
 # Telegram Bot API 發送端與檔案下載
 # ======================================================================
 import asyncio
+import contextvars
 
 import requests
 
 from config import TELEGRAM_TOKEN, redact
 from logging_setup import logger
+
+# ----------------------------------------------------------------------
+# 橋接擷取模式（供 bridge/server.py 使用）
+# ----------------------------------------------------------------------
+# send_telegram_message 是全系統唯一的發送出口（handlers/push/sentinel 等一律
+# 經此函式），故只需在此單點攔截即可讓 Hermes 橋接「借用」既有的對話/指令邏輯、
+# 取回文字答案而不觸碰真正的 Telegram 頻道。ContextVar 是 asyncio-task-local，
+# 一般 Telegram 輪詢路徑（未呼叫 start_capture）行為完全不受影響、零改動風險。
+_capture_var: "contextvars.ContextVar[list | None]" = contextvars.ContextVar("capture", default=None)
+
+
+def start_capture():
+    """開始擷取本 asyncio 任務接下來呼叫的 send_telegram_message 內容，回傳還原用的 token。"""
+    return _capture_var.set([])
+
+
+def stop_capture(token) -> str:
+    """停止擷取並還原，回傳擷取期間累積的訊息文字（多則以換行連接）。"""
+    chunks = _capture_var.get() or []
+    _capture_var.reset(token)
+    return "\n".join(c for c in chunks if c)
 
 # 下載檔案大小上限（Telegram bot 下載上限約 20MB，照片遠小於此）。防爆記憶體。
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -59,9 +81,16 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
     3. reply_markup（選用）：附帶 reply keyboard 等鍵盤定義。分段時只掛在
        最後一段，避免每段都重設鍵盤。
     """
+    text = "" if text is None else str(text)
+
+    capture = _capture_var.get()
+    if capture is not None:
+        # 橋接擷取模式：收進清單、不發真正的 Telegram API（避免與 Hermes 的轉述重複通知）。
+        capture.append(text)
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     loop = asyncio.get_running_loop()
-    text = "" if text is None else str(text)
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
     for idx, chunk in enumerate(chunks):
         is_last = idx == len(chunks) - 1
@@ -84,6 +113,10 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
 
 
 async def send_typing_action(chat_id):
+    if _capture_var.get() is not None:
+        # 橋接擷取模式：不對真正的 Telegram 頻道送 typing——否則使用者會看到
+        # agribot「輸入中…」卻永遠等不到訊息（答案是回給 Hermes 的）。
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction"
     payload = {"chat_id": chat_id, "action": "typing"}
 
