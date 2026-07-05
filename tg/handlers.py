@@ -57,7 +57,8 @@ from storage.pushlog import load_last_push_brief
 from storage.vision_log import load_visual_history
 from storage.state import active_crops, load_state, set_crop_tracking, update_state
 from tg.api import (
-    BTN_FULL_ANALYSIS, BTN_SNAPSHOT, FARM_KEYBOARD, FARM_STATUS_QUESTION,
+    BTN_FERTILIZED, BTN_FULL_ANALYSIS, BTN_SNAPSHOT, FARM_KEYBOARD,
+    FARM_STATUS_QUESTION, FERTILIZE_PHRASE,
     download_telegram_photo, send_telegram_message, send_typing_action,
 )
 from watchdog import SCRAPER_FAILURE_ALERT_THRESHOLD, WATCHDOG_LOCK, WATCHDOG_STATE
@@ -90,8 +91,8 @@ async def handle_local_command(chat_id, text) -> bool:
             "/threshold dry=30 wet=80 — 手動設定土壤濕度警戒門檻（全園共用）\n"
             "/crop 空心菜 — 設定對話焦點作物\n"
             "/reset — 清空 AI 對話歷史\n"
-            "👇 輸入框下方常駐兩顆快捷鍵：「🌱 耕地快照」＝秒回現況（同 /status）、"
-            "「🔍 完整分析」＝即時爬取後做完整 AI 評估。\n"
+            "👇 輸入框下方常駐快捷鍵：「🌱 耕地快照」＝秒回現況（同 /status）、"
+            "「🔍 完整分析」＝即時爬取後做完整 AI 評估、「🧪 已施肥」＝一鍵登記施肥（會先確認一次）。\n"
             "💬 也可以直接自然地告訴我「我收成了」「我施肥了」或上傳收成照片，"
             "我會幫你登記（登記前會跟你確認一次）。"
         ), reply_markup=FARM_KEYBOARD)
@@ -333,6 +334,11 @@ async def handle_message(message):
         # 即時爬取後分析。改寫 text/user_input_text 後讓流程照常進行。
         text = FARM_STATUS_QUESTION
         user_input_text = FARM_STATUS_QUESTION
+    if not photo and text == BTN_FERTILIZED:
+        # 已施肥：等同對 AI 說「我施肥了」，往下交由既有施肥登記流程
+        # （AI 會發起待確認事件、預設會記、給喊停視窗）。改寫後照常進行。
+        text = FERTILIZE_PHRASE
+        user_input_text = FERTILIZE_PHRASE
 
     # ⚙️ 待確認事件攔截：若上一輪 AI 發起了收成/施肥登記且尚在等待確認，
     # 這一則訊息優先當作「確認回覆」處理（預設會記、明確否定才取消）。

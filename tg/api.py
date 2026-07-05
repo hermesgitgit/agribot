@@ -61,13 +61,18 @@ MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 # 且 api.py 不反向 import 任何上層模組，無循環依賴之虞。
 BTN_SNAPSHOT = "🌱 耕地快照"
 BTN_FULL_ANALYSIS = "🔍 完整分析"
+BTN_FERTILIZED = "🧪 已施肥"          # 一鍵登記施肥（等同對 AI 說「我施肥了」，走既有確認流程）
 FARM_STATUS_QUESTION = "現在耕地的狀況如何？"
+FERTILIZE_PHRASE = "我施肥了"          # 按下「已施肥」時代打的句子，交由 AI 走施肥登記流程
 
 FARM_KEYBOARD = {
-    "keyboard": [[{"text": BTN_SNAPSHOT}, {"text": BTN_FULL_ANALYSIS}]],
+    "keyboard": [
+        [{"text": BTN_SNAPSHOT}, {"text": BTN_FULL_ANALYSIS}],  # 第一列：查耕地狀況
+        [{"text": BTN_FERTILIZED}],                            # 第二列：登記類動作
+    ],
     "resize_keyboard": True,    # 依按鍵數量自動縮成單列高度，不占滿半個螢幕
     "is_persistent": True,      # 常駐顯示（使用者收合後仍可隨時再叫出）
-    "input_field_placeholder": "輸入訊息，或點下方按鍵查耕地狀況…",
+    "input_field_placeholder": "輸入訊息，或點下方按鍵查狀況／記施肥…",
 }
 
 
