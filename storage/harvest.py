@@ -25,9 +25,28 @@ from config import DB_FILE, TZ_TAIPEI
 from logging_setup import logger
 from science.cadence import cadence_brief, cadence_summary_lines
 from storage.common import STATE_FILE_LOCK
-from storage.state import load_state
+from storage.state import find_tracked_crop, load_state
+
+
+def _resolve_crop(state, crop_hint: str = "") -> str:
+    """把使用者提到的作物對應到 state 裡實際存在的作物鍵；對不上就用焦點作物。
+
+    比對用 find_tracked_crop（以 state 現有的鍵為準），因為 state 裡的鍵可能是
+    自訂名而非 GDD 資料庫的標準鍵——只用正規化結果去比會對不上。
+    """
+    focus = state.get("crop_name", "未設定作物")
+    hint = (crop_hint or "").strip()
+    if not hint:
+        return focus
+    return find_tracked_crop(state.get("crops", {}), hint) or focus
 
 HARVEST_TABLE_READY = False
+
+
+# 距上次割收超過這個天數，就不視為同一輪的再生間隔，而是新一輪的基準點。
+# 空心菜這類多次採收的葉菜再生約 7~14 天，抓 45 天足以容納季節性放慢，
+# 又能擋掉清園休耕、漏登記造成的超長空窗污染節律統計。
+HARVEST_CYCLE_GAP_DAYS = 45
 
 
 def _ensure_harvest_table():
@@ -60,16 +79,21 @@ def _current_accumulated_gdd(state, crop_name) -> float:
     return float(state.get("crops", {}).get(crop_name, {}).get("accumulated_gdd", 0.0))
 
 
-def record_harvest(note: str = "") -> str:
+def record_harvest(note: str = "", crop_hint: str = "") -> str:
     """
     登記一次割收事件。自動計算與「同作物上一次割收」的間隔天數與期間累積 GDD；
     若是該作物切換後的首次割收，標記為建立期基準點。回傳給使用者的結果訊息。
+
+    crop_hint：使用者明講的作物（如「今天把空心菜割了」）。過去這個提示只被塞進
+    備註字串，割收一律記到「焦點作物」頭上——同時種番茄與空心菜時，割空心菜會
+    被記成割番茄，連 gdd_since_prev 都用番茄的積溫算，之後的節律統計就是不存在
+    的數字。現在會先比對追蹤中的作物，比對不到才退回焦點作物。
     """
     _ensure_harvest_table()
     now = datetime.datetime.now(TZ_TAIPEI)
     today_str = now.strftime("%Y-%m-%d")
     state = load_state()
-    crop_name = state.get("crop_name", "未設定作物")
+    crop_name = _resolve_crop(state, crop_hint)
     acc_gdd = _current_accumulated_gdd(state, crop_name)
 
     try:
@@ -100,6 +124,17 @@ def record_harvest(note: str = "") -> str:
                 except Exception:
                     days_since = None
                 gdd_since = round(acc_gdd - float(prev[1]), 2) if prev[1] is not None else None
+                # 休耕空窗不是一次再生週期：清園後隔兩個月再種回同一作物，
+                # 或單純漏登記幾輪，都會產生一個超長間隔。把它照樣寫成再生週期，
+                # 會讓 cadence 的「近三次」變成 [9, 9, 120]、平均值失真且永久留存。
+                # 超過門檻就視為新一輪的基準點（不計間隔），與作物切換的首次割收同等處理。
+                if days_since is not None and days_since > HARVEST_CYCLE_GAP_DAYS:
+                    logger.info(
+                        f"🌱 [Harvest] {crop_name} 距上次割收 {days_since} 天，"
+                        f"超過 {HARVEST_CYCLE_GAP_DAYS} 天視為新一輪的基準點，本次不計再生間隔。")
+                    is_first = 1
+                    days_since = None
+                    gdd_since = None
 
             conn.execute(
                 "INSERT INTO harvest_records "

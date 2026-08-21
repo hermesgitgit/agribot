@@ -86,7 +86,7 @@ def format_6h_history(history_list) -> str:
     將官方 API 的歷史區間資料格式化。
     """
     if not history_list or not isinstance(history_list, list) or len(history_list) == 0:
-        return "【過去 6 小時歷史感測數據趨勢】：未成功獲取或無數據。"
+        return "【歷史感測數據趨勢】：未成功獲取或無數據。"
 
     try:
         times, air_temps, air_hums, soil_temps, soil_moistures, soil_conductivities = [], [], [], [], [], []
@@ -109,8 +109,11 @@ def format_6h_history(history_list) -> str:
         n_points = len(times)
         
         def format_iso_time(iso_str):
+            # 只印時分會讓跨日區間看起來像倒退（例：15:00 ~ 15:00、22:00 ~ 06:00），
+            # AI 會據此把 24 小時的變化當成幾小時內發生，推出錯誤的失水速率。
+            # 一律帶上月日。
             full = _iso_to_taipei_str(iso_str)
-            return full[11:] if full else iso_str[-8:]
+            return full[5:] if full else iso_str[-8:]
 
         start_time_local = format_iso_time(times[0])
         end_time_local = format_iso_time(times[-1])
@@ -240,14 +243,25 @@ def get_agriweather_data(include_advice: bool = False) -> str:
 
         # 取最新一筆：即時優先，缺則退回歷史最後一筆（皆以 time 取最新，不依賴排序方向）
         point = _latest_point(rt_list) or _latest_point(hist_list)
-        sensors_scraped_ok = bool(point)
-        if not sensors_scraped_ok:
-            logger.warning("⚠️ 兩支 API 皆無法取得有效數據。")
 
         # 欄位對映：只收數值型，非數值（None/字串）視為無資訊
         def _num(v):
             return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
-        scraped = {sys_key: _num(point.get(api_key)) for api_key, sys_key in _FIELD_MAP.items()}
+        scraped = {sys_key: _num(point.get(api_key)) for api_key, sys_key in _FIELD_MAP.items()} if point else {}
+
+        # 「有沒有列」不等於「有沒有值」：閘道漏傳一次上行時，最新那列會是
+        # 時間戳有、其餘全 null。過去只看 bool(point) 就判定成功，於是哨兵整小時
+        # 不做任何乾旱／積水判斷、歷史多一列垃圾，而看門狗仍記為連續失敗 0、
+        # 不發任何健康警報。改為「至少要有一個實際數值」才算成功。
+        values_present = sum(1 for v in scraped.values() if v is not None)
+        sensors_scraped_ok = values_present > 0
+        if not sensors_scraped_ok:
+            if point:
+                logger.warning("⚠️ 取得感測列但所有欄位皆為空值（閘道可能漏傳上行），本輪視為失敗。")
+            else:
+                logger.warning("⚠️ 兩支 API 皆無法取得有效數據。")
+        elif values_present < len(_FIELD_MAP):
+            logger.warning(f"⚠️ 感測資料不完整：{len(_FIELD_MAP) - values_present} 個欄位無值。")
 
         report_scraper_result("agri", sensors_scraped_ok)
 
@@ -272,7 +286,9 @@ def get_agriweather_data(include_advice: bool = False) -> str:
             "soil_ec": fmt(scraped.get("soil_ec"), "ds/m"),
             "irrigation_advice": irrigation_advice,
             "fertilization_advice": fertilization_advice,
-            "past_6h_summary": format_6h_history(hist_list),
+            # key 名不再宣稱「6 小時」：這個區間實際涵蓋官方 API 回傳的整段歷史
+            # （常為 24 小時），標籤與內容不符會讓 AI 推出錯誤的變化速率。
+            "history_summary": format_6h_history(hist_list),
         }
         result = json.dumps(final_data, ensure_ascii=False)
         logger.info(f"✅ [Agri API] 擷取成功: {result}")

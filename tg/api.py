@@ -46,6 +46,15 @@ def stop_capture(token) -> str:
     _capture_var.reset(token)
     return "\n".join(c for c in chunks if c)
 
+
+def is_capturing() -> bool:
+    """目前這個 asyncio 任務是否處於橋接擷取模式（回覆給 HTTP 呼叫端而非擁有者）。
+
+    擷取模式下擁有者看不到任何訊息，因此所有「先告知、給喊停視窗」的機制都不成立，
+    需要據此拒絕會寫入長期記錄的操作。
+    """
+    return _capture_var.get() is not None
+
 # 下載檔案大小上限（Telegram bot 下載上限約 20MB，照片遠小於此）。防爆記憶體。
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
@@ -99,22 +108,52 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
     for idx, chunk in enumerate(chunks):
         is_last = idx == len(chunks) - 1
-        try:
-            payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"}
-            if reply_markup is not None and is_last:
-                payload["reply_markup"] = reply_markup
-            r = await loop.run_in_executor(
-                None, lambda p=payload: requests.post(url, json=p, timeout=10))
-            if r.status_code == 400:
-                plain = {"chat_id": chat_id, "text": chunk}
+        # 多段訊息之間插一個間隔：Telegram 對同一對話約 1 則/秒，零間隔連發會讓
+        # 後段吃 429。長知識庫回答過去就是這樣在句子中間斷掉的。
+        if idx > 0:
+            await asyncio.sleep(1.1)
+        # 只在 400 退回純文字、其餘失敗直接丟棄，等於哨兵警報遇到一次 5xx 或
+        # 連線逾時就永久消失。改成退避重試：429 照 retry_after 走，5xx／網路錯誤
+        # 指數退避，四次都失敗才放棄並留下 error 等級日誌。
+        sent = False
+        for attempt in range(4):
+            try:
+                payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"}
                 if reply_markup is not None and is_last:
-                    plain["reply_markup"] = reply_markup
+                    payload["reply_markup"] = reply_markup
                 r = await loop.run_in_executor(
-                    None, lambda p=plain: requests.post(url, json=p, timeout=10))
-            if r.status_code != 200:
-                logger.warning(f"⚠️ 發送 Telegram 失敗: {r.status_code}, {redact(r.text)}")
-        except Exception as e:
-            logger.warning(f"⚠️ 發送 Telegram 網路錯誤: {redact(e)}")
+                    None, lambda p=payload: requests.post(url, json=p, timeout=10))
+                if r.status_code == 400:
+                    # Markdown 解析失敗 → 退成純文字（這條是「換內容」不是「重試」）
+                    plain = {"chat_id": chat_id, "text": chunk}
+                    if reply_markup is not None and is_last:
+                        plain["reply_markup"] = reply_markup
+                    r = await loop.run_in_executor(
+                        None, lambda p=plain: requests.post(url, json=p, timeout=10))
+                if r.status_code == 200:
+                    sent = True
+                    break
+                if r.status_code == 429:
+                    try:
+                        wait = int((r.json().get("parameters") or {}).get("retry_after", 1))
+                    except Exception:
+                        wait = 1
+                    logger.warning(f"⚠️ Telegram 限流，{wait} 秒後重送第 {idx + 1} 段")
+                    await asyncio.sleep(min(wait, 30))
+                    continue
+                if 500 <= r.status_code < 600:
+                    logger.warning(f"⚠️ Telegram {r.status_code}，重試第 {idx + 1} 段")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                # 其餘 4xx 重送也不會好（例如被封鎖、chat 不存在）
+                logger.error(f"❌ 發送 Telegram 失敗: {r.status_code}, {redact(r.text)}")
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ 發送 Telegram 網路錯誤（第 {attempt + 1} 次）: {redact(e)}")
+                await asyncio.sleep(2 ** attempt)
+        if not sent:
+            logger.error(f"❌ 第 {idx + 1}/{len(chunks)} 段訊息最終未送達，內容前 60 字："
+                         f"{redact(chunk[:60])}")
 
 
 async def send_typing_action(chat_id):

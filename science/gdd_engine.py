@@ -34,7 +34,7 @@ from storage.history import query_history_records
 from storage.predictions import evaluate_due_predictions
 from storage.state import active_crops, load_state, update_state
 from storage.summaries import save_daily_summary_for_date
-from storage.temp_log import get_temps_for_date
+from storage.temp_log import get_sample_hours_for_date, get_temps_for_date
 
 
 def day_minmax(target_date_str: str):
@@ -59,6 +59,18 @@ def day_minmax(target_date_str: str):
         if len(history_temps) > len(temps):
             temps = history_temps
             source = "sensor_history (事件式取樣備援)"
+
+    # 覆蓋度檢查：GDD 用「當日最高與最低溫」估算，若整天的取樣只落在凌晨（例如
+    # bot 半夜停機、隔天中午才啟動並立刻結算昨日），max/min 都來自同一段時間，
+    # 算出來的積溫會嚴重偏低、而且一旦寫入就永久定案。要求取樣至少跨越 6 小時，
+    # 否則視同缺數據跳過——寧可不記，也不要記一個錯的。
+    hours = get_sample_hours_for_date(target_date_str) if temps else set()
+    if len(temps) >= 2 and hours and (max(hours) - min(hours)) < 6:
+        logger.warning(
+            f"⚠️ [GDD Engine] {target_date_str} 的溫度取樣僅涵蓋 "
+            f"{min(hours):02d}~{max(hours):02d} 時（跨距不足 6 小時），"
+            f"以此估算日均溫會偏誤，該日標記為缺數據跳過。")
+        return None, None, "取樣時段覆蓋不足（跨距 < 6 小時）"
 
     if len(temps) >= 2:
         return max(temps), min(temps), source
@@ -229,8 +241,13 @@ async def check_and_update_gdd() -> str:
         if r["skipped"]:
             notes += f"\n  ⚠️ 更早的 {r['skipped']} 天缺口已超出 {GDD_BACKFILL_MAX_DAYS} 天回補上限，未予結算。"
         congrats = ""
-        if new_gdd >= target_gdd:
+        # 只在「這次剛跨過門檻」時道賀。過去是每天只要 new_gdd >= target 就喊一次，
+        # 空心菜約 21 天達標、種三個月就連喊 70 幾天，而且這則推播會被寫進
+        # last_push.json 再注入對話 prompt，讓 AI 一直以為「系統剛建議採收」。
+        if new_gdd >= target_gdd > (new_gdd - r["added"]):
             congrats = f"\n  🎉 已達成熟目標積溫 ({target_gdd} ℃-day)！建議評估採收。"
+        elif new_gdd >= target_gdd:
+            congrats = f"\n  ✅ 已超過目標積溫（{round(new_gdd - target_gdd, 1)} ℃-day）。"
         sections.append(
             f"🌾 {r['crop_disp']}{param_note}（基溫 {r['t_base']}℃ / 上限 {r['t_upper']}℃）\n"
             + "\n".join(r["lines"]) + "\n"

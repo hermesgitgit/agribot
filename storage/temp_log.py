@@ -107,3 +107,27 @@ def get_temps_for_date(date_str) -> list:
     except Exception as e:
         logger.warning(f"⚠️ [Temp Log] 讀取氣溫日誌失敗: {e}")
         return []
+
+
+def get_sample_hours_for_date(date_str) -> set:
+    """取出該日有溫度取樣的「小時」集合（0~23），供 GDD 判斷取樣是否涵蓋全天。
+
+    只有兩三個凌晨的點也能算出 max/min，但那個日均溫是錯的；GDD 一旦寫入就
+    永久定案，所以結算前要能看出「這天的取樣根本沒涵蓋白天」。
+    """
+    try:
+        with STATE_FILE_LOCK:
+            conn = sqlite3.connect(DB_FILE)
+            rows = conn.execute("SELECT ts FROM temp_log WHERE ts LIKE ?",
+                                (date_str + "%",)).fetchall()
+            conn.close()
+        hours = set()
+        for (ts,) in rows:
+            try:
+                hours.add(int(str(ts)[11:13]))
+            except (ValueError, IndexError):
+                continue
+        return hours
+    except Exception as e:
+        logger.warning(f"⚠️ [Temp Log] 讀取取樣時段失敗: {e}")
+        return set()

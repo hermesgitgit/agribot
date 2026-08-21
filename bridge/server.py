@@ -60,6 +60,10 @@ READONLY_LOCAL_COMMANDS = frozenset({
 MAX_BODY_BYTES = 16 * 1024
 
 
+# 橋接 /ask 的併發閘門（在主 asyncio 迴圈上建立，見 _ensure_gate）。
+_ASK_GATE = asyncio.Lock()
+
+
 def _run_coro_blocking(coro, timeout):
     """把協程排到主 asyncio 迴圈執行，在目前（HTTP handler）執行緒阻塞等結果。"""
     fut = asyncio.run_coroutine_threadsafe(coro, _main_loop)
@@ -75,13 +79,19 @@ def _run_coro_blocking(coro, timeout):
 
 
 async def _ask(text: str) -> str:
-    token = start_capture()
-    try:
-        message = {"chat": {"id": int(TELEGRAM_CHAT_ID)}, "text": text}
-        await handle_message(message)
-    finally:
-        reply = stop_capture(token)
-    return reply
+    # 橋接請求彼此序列化：逾時被 cancel 時，handle_message 裡那個
+    # asyncio.to_thread 的 Gemini 呼叫「不會」跟著停（它在別的執行緒重試、可能
+    # 還在 sleep 130 秒），但 CancelledError 會讓對話鎖的 async with 立刻退出。
+    # 於是下一個請求或擁有者的訊息會拿到鎖、對同一個 ChatSession 併發送出。
+    # 這道閘門確保同一時間只有一個橋接請求在飛；擁有者側的鎖仍由 handlers 負責。
+    async with _ASK_GATE:
+        token = start_capture()
+        try:
+            message = {"chat": {"id": int(TELEGRAM_CHAT_ID)}, "text": text}
+            await handle_message(message)
+        finally:
+            reply = stop_capture(token)
+        return reply
 
 
 async def _local(command_text: str):

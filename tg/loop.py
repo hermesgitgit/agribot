@@ -57,7 +57,12 @@ async def telegram_bot_loop():
     
     import requests
     loop = asyncio.get_running_loop()
-    
+    # ok=false 的退避秒數。Telegram 對 409（另一個 getUpdates 實例，如部署時新舊
+    # 容器並存）、429（限流）、401（token 失效）回的是 HTTP 非 200 但合法的 JSON，
+    # .json() 不會拋例外——過去沒有 else 分支，迴圈就以網路往返速度空轉：bot 完全
+    # 收不到訊息、輪詢路徑不留任何日誌，而心跳照寫、健康檢查看起來一切正常。
+    backoff = 5
+
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -68,28 +73,40 @@ async def telegram_bot_loop():
                 lambda: requests.get(url, params=params, timeout=35).json()
             )
             
-            if response.get("ok"):
-                for update in response.get("result", []):
-                    message = update.get("message")
-                    if message and ("text" in message or "photo" in message
-                                    or "voice" in message or "audio" in message):
-                        # at-least-once：處理完成才推進 offset。若中途 crash／重啟，offset 未推進，
-                        # Telegram 會重送此 update（寧可極少數重做，也不靜默漏掉記施肥/收成等訊息）。
-                        # wait_for 逾時保險：handler 卡死時放棄該則並照常推進，避免毒訊息卡住整個輪詢。
-                        try:
-                            await asyncio.wait_for(handle_message(message), timeout=300)
-                        except asyncio.TimeoutError:
-                            logger.error(f"⚠️ handle_message 逾時(>300s)，跳過 update {update['update_id']}")
-                        except Exception as e:
-                            logger.error(f"⚠️ handle_message 例外: {redact(e)}")
-                    # 不論該則是否需處理，都推進到此 update（已處理／已略過／已放棄）。
-                    # 必須同時推進「記憶體中的 offset」——下一次 getUpdates 用的是它，
-                    # 只寫檔不更新變數會讓 getUpdates 一直重抓同一批 → 無限迴圈。
-                    offset = update["update_id"] + 1
+            if not response.get("ok"):
+                retry_after = (response.get("parameters") or {}).get("retry_after")
+                code = response.get("error_code")
+                delay = int(retry_after) if retry_after else backoff
+                if not retry_after:
+                    backoff = min(backoff * 2, 60)
+                # 401/409 不會自己好，要讓它在 log 裡是 error 等級而不是靜默
+                level = logger.error if code in (401, 409) else logger.warning
+                level(f"⚠️ getUpdates 回 ok=false（error_code={code}）："
+                      f"{redact(response.get('description'))}，{delay} 秒後重試")
+                await asyncio.sleep(delay)
+                continue
+            backoff = 5
+            for update in response.get("result", []):
+                message = update.get("message")
+                if message and ("text" in message or "photo" in message
+                                or "voice" in message or "audio" in message):
+                    # at-least-once：處理完成才推進 offset。若中途 crash／重啟，offset 未推進，
+                    # Telegram 會重送此 update（寧可極少數重做，也不靜默漏掉記施肥/收成等訊息）。
+                    # wait_for 逾時保險：handler 卡死時放棄該則並照常推進，避免毒訊息卡住整個輪詢。
                     try:
-                        atomic_write_json(TELEGRAM_OFFSET_FILE, {"offset": offset})
-                    except Exception as off_err:
-                        logger.warning(f"⚠️ 寫入 Telegram offset 檔失敗: {off_err}")
+                        await asyncio.wait_for(handle_message(message), timeout=300)
+                    except asyncio.TimeoutError:
+                        logger.error(f"⚠️ handle_message 逾時(>300s)，跳過 update {update['update_id']}")
+                    except Exception as e:
+                        logger.error(f"⚠️ handle_message 例外: {redact(e)}")
+                # 不論該則是否需處理，都推進到此 update（已處理／已略過／已放棄）。
+                # 必須同時推進「記憶體中的 offset」——下一次 getUpdates 用的是它，
+                # 只寫檔不更新變數會讓 getUpdates 一直重抓同一批 → 無限迴圈。
+                offset = update["update_id"] + 1
+                try:
+                    atomic_write_json(TELEGRAM_OFFSET_FILE, {"offset": offset})
+                except Exception as off_err:
+                    logger.warning(f"⚠️ 寫入 Telegram offset 檔失敗: {off_err}")
 
 
         except Exception as e:

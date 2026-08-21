@@ -34,8 +34,8 @@ from agent.guard import (
     MAX_THRESHOLD_STEP, apply_crop_command, apply_threshold_command, strip_links,
 )
 from agent.pending import (
-    classify_confirmation, clear_pending_event, commit_pending_event,
-    get_pending_event, set_current_chat_context,
+    _set_pending_event, classify_confirmation, clear_pending_event,
+    commit_pending_event, get_pending_event, set_current_chat_context,
 )
 from agent.prompts import build_kb_context, build_state_summary, get_current_time_context
 from agent.session import (
@@ -292,9 +292,47 @@ async def handle_local_command(chat_id, text) -> bool:
     return False  # 未知指令交由 AI 處理
 
 
+# 備援模型沒有工具，卻會用語言慣例寫出「已為您記錄」這種話——使用者據此以為
+# 登記成功，實際上什麼都沒寫。這是靜默資料遺失＋積極的錯誤保證，必須兩面堵：
+# 一面在 prompt 明講能力邊界，一面在輸出端攔截假承諾（不依賴模型聽話）。
+_FALLBACK_CAPABILITY_NOTE = (
+    "\n\n【本次回覆的硬性限制】你是備援模型，沒有任何工具，"
+    "無法登記、寫入、修改或查詢任何資料，也無法調整門檻或作物設定。"
+    "絕對不可聲稱已完成任何記錄、登記、設定或變更。"
+    "若使用者要求的是登記類動作（施肥、收成、調門檻等），"
+    "請明確告訴他這次沒有登記成功、請稍後再試一次。"
+    "只根據上面已提供的資料做文字說明。"
+)
+
+# 假承諾的措辭：命中就整段換掉，不讓它以任何形式送到使用者眼前。
+_FALSE_PROMISE_RE = re.compile(
+    r"(已(經)?(為您|幫您|幫你|為你)?"
+    r"(記錄|登記|紀錄|寫入|儲存|存檔|設定|更新|調整|完成|新增))"
+    r"|(記錄|登記|紀錄)(好|完成)了"
+    r"|(已受理|已幫你處理|已幫您處理)"
+)
+
+
 def _text_only_prompt(prompt_parts):
     """從多模態 prompt_parts 取出純文字部分，供文字備援模型使用（它吃不了圖片）。"""
-    return "\n\n".join(p for p in prompt_parts if isinstance(p, str)).strip()
+    body = "\n\n".join(p for p in prompt_parts if isinstance(p, str)).strip()
+    return (body + _FALLBACK_CAPABILITY_NOTE) if body else ""
+
+
+def _guard_fallback_text(text: str) -> str:
+    """攔下備援模型宣稱「已完成登記」的假承諾。"""
+    if not text:
+        return text
+    if _FALSE_PROMISE_RE.search(text):
+        logger.warning("⚠️ 備援模型宣稱已完成登記，已攔截並改為明確告知未登記。")
+        return (
+            "⚠️ 這一輪由備援模型回覆，它沒有登記/寫入資料的能力。\n"
+            "如果你剛才是要登記施肥或收成，**這次並未登記成功**——"
+            "請用「🧪 已施肥」按鈕，或稍後再說一次。\n\n"
+            "（以下為備援模型的文字說明，其中任何「已記錄」的說法都不成立）\n\n"
+            + text
+        )
+    return text
 
 
 async def handle_message(message):
@@ -335,10 +373,22 @@ async def handle_message(message):
         text = FARM_STATUS_QUESTION
         user_input_text = FARM_STATUS_QUESTION
     if not photo and text == BTN_FERTILIZED:
-        # 已施肥：等同對 AI 說「我施肥了」，往下交由既有施肥登記流程
-        # （AI 會發起待確認事件、預設會記、給喊停視窗）。改寫後照常進行。
-        text = FERTILIZE_PHRASE
-        user_input_text = FERTILIZE_PHRASE
+        # 已施肥：按鈕的意圖是明確且固定的，不該取決於某個模型這一輪有沒有
+        # 呼叫工具。過去這裡改寫成一句話交給 AI，Gemini 壅塞時會退到不帶工具
+        # 的備援模型，備援只會寫字——於是它回「已記錄您施肥的動作」，實際上
+        # 什麼都沒寫，使用者要好幾天後才會從錯誤的施肥日期發現。
+        # 現在直接以規則發起待確認事件，AI 只負責講話。
+        ok = _set_pending_event(chat_id, "fertilizer", "使用者按下「已施肥」")
+        if ok:
+            await send_telegram_message(
+                chat_id,
+                "🧪 已收到「已施肥」，將為你登記本次施肥。\n"
+                "若只是誤觸，10 分鐘內回覆「不用」即可取消。")
+            return
+        # 已有另一筆待確認事件 → 交給下方的確認攔截處理，不要吃掉這次點擊
+        await send_telegram_message(
+            chat_id, "目前還有一筆尚未確認的登記，請先回覆前一則確認，再按一次「已施肥」。")
+        return
 
     # ⚙️ 待確認事件攔截：若上一輪 AI 發起了收成/施肥登記且尚在等待確認，
     # 這一則訊息優先當作「確認回覆」處理（預設會記、明確否定才取消）。
@@ -531,7 +581,7 @@ async def handle_message(message):
             tp = _text_only_prompt(prompt_parts)
             fb = await asyncio.to_thread(generate_report_text, tp) if tp else ""
             ai_message = (
-                "🛟（Gemini 未能生成，改用備援模型）\n\n" + strip_links(fb, source_tag="對話備援")
+                "🛟（Gemini 未能生成，改用備援模型）\n\n" + _guard_fallback_text(strip_links(fb, source_tag="對話備援"))
             ) if fb else "（這一輪我沒有成功產生文字回覆，請再說一次或換個說法試試。）"
 
         logger.info(f"🤖 Gemini 回覆:\n{ai_message}")
@@ -550,7 +600,7 @@ async def handle_message(message):
                 except Exception as fb_err:
                     logger.warning(f"⚠️ 對話備援也失敗: {redact(fb_err)}")
         if fb:
-            await send_telegram_message(chat_id, "🛟（Gemini 暫時壅塞，改用備援模型）\n\n" + strip_links(fb, source_tag="對話備援"))
+            await send_telegram_message(chat_id, "🛟（Gemini 暫時壅塞，改用備援模型）\n\n" + _guard_fallback_text(strip_links(fb, source_tag="對話備援")))
         else:
             await send_telegram_message(chat_id, "❌ 系統分析暫時失敗（Gemini 忙線），請稍後再試。")
     finally:

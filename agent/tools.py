@@ -25,6 +25,7 @@ import re
 
 from agent.guard import MAX_THRESHOLD_STEP
 from agent.pending import _current_chat_ctx, _set_pending_event
+from config import now_taipei
 from agent.prompts import build_disease_report, build_state_summary
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE, lookup_crop_info, match_crop_key
@@ -87,6 +88,20 @@ def tool_set_thresholds(dry: float, wet: float, lifecycle_stage: str) -> str:
         if abs(new_dry - cur_dry) > MAX_THRESHOLD_STEP or abs(new_wet - cur_wet) > MAX_THRESHOLD_STEP:
             return (f"❌ 設定被拒絕：單次調幅超過 ±{MAX_THRESHOLD_STEP} 百分點"
                     f"（目前 dry={cur_dry}, wet={cur_wet}）。請建議使用者以 /threshold 手動指令進行大幅調整。")
+        # 單次上限擋不住「同一輪連呼四次、每次都合法」的漸進式漂移——被注入的
+        # 爬取文字可以誘導模型把警報門檻一路調到永不觸發。加一道當日累計上限：
+        # 以今天第一次調整前的基準值為錨，全天總位移同樣不得超過 ±MAX_THRESHOLD_STEP。
+        today = now_taipei().strftime("%Y-%m-%d")
+        anchor = state.get("threshold_anchor") or {}
+        if anchor.get("date") != today:
+            anchor = {"date": today, "dry": cur_dry, "wet": cur_wet}
+        base_dry, base_wet = float(anchor["dry"]), float(anchor["wet"])
+        if (abs(new_dry - base_dry) > MAX_THRESHOLD_STEP
+                or abs(new_wet - base_wet) > MAX_THRESHOLD_STEP):
+            return (f"❌ 設定被拒絕：今日累計調幅已達 ±{MAX_THRESHOLD_STEP} 百分點上限"
+                    f"（今日基準 dry={base_dry}, wet={base_wet}）。"
+                    f"如需更大調整請使用者以 /threshold 手動指令進行。")
+        state["threshold_anchor"] = anchor
         state["lifecycle"] = f"{lifecycle_stage} (AI 自主評估生長階段)"
         state["dry_threshold"] = new_dry
         state["wet_threshold"] = new_wet
@@ -199,7 +214,10 @@ def tool_record_harvest_event(crop_hint: str = "", note: str = "") -> str:
     if _current_chat_ctx.get() is None:
         return "（無法登記：缺少對話內容）"
     note_full = (f"{crop_hint} {note}".strip())[:100]
-    ok = _set_pending_event(_current_chat_ctx.get(), "harvest", note_full)
+    # crop_hint 另外獨立帶著走：只塞進備註字串的話，落檔時 record_harvest 讀的
+    # 仍是「焦點作物」，同時種多種作物時會把割收記到錯的作物頭上。
+    ok = _set_pending_event(_current_chat_ctx.get(), "harvest", note_full,
+                            crop_hint=(crop_hint or "").strip()[:30])
     if not ok:
         return "目前已有另一筆尚未確認的事件，請先請使用者回覆前一個確認，再處理這次收成登記。"
     return "已發起收成登記的確認（若使用者於 10 分鐘內未回覆取消，系統將自動完成登記）。請在回覆中告知使用者你將為他登記這次收成，若只是隨口提及可回覆『不用』取消。"

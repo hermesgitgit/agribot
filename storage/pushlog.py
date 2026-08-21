@@ -43,11 +43,17 @@ def _write_hermes_outbox(kind: str, text: str):
         os.makedirs(HERMES_OUTBOX_DIR, exist_ok=True)
         safe_kind = re.sub(r"[^\w一-鿿-]", "_", kind)[:40]
         fname = f"{int(time.time() * 1000)}_{safe_kind}.json"
-        atomic_write_json(os.path.join(HERMES_OUTBOX_DIR, fname), {
+        outpath = os.path.join(HERMES_OUTBOX_DIR, fname)
+        atomic_write_json(outpath, {
             "ts": now_taipei().strftime("%Y-%m-%d %H:%M"),
             "kind": kind,
             "text": (text or "")[:_OUTBOX_TEXT_MAX_CHARS],
         })
+        # atomic_write_json 走 mkstemp（暫存檔固定 0600）、os.replace 原樣保留權限，
+        # 對面讀信箱的 Hermes 容器（uid 1000）會 Errno 13 整批讀不到（2026-08-19
+        # 實測：到家報告滿版「無法讀取的項目」）。信箱本來就是要給對面讀的，
+        # 這一路放寬到 0644；狀態檔（state/last_push）維持 mkstemp 預設不動。
+        os.chmod(outpath, 0o644)
         # 滾動清理：檔名以 epoch ms 開頭，字典序即時間序
         entries = sorted(f for f in os.listdir(HERMES_OUTBOX_DIR) if f.endswith(".json"))
         for old in entries[:-_OUTBOX_KEEP_MAX]:

@@ -58,12 +58,21 @@ def get_current_chat_context():
     return _current_chat_ctx.get()
 
 
-def _set_pending_event(chat_id, ev_type, note):
+def _set_pending_event(chat_id, ev_type, note, crop_hint=""):
     """
     登記一筆待確認事件。若該對話已有未決事件（前一個尚未被使用者確認/取消），
     不覆蓋——保留先發起的事件,避免「你以為在確認 A、實際確認到 B」的張冠李戴。
     回傳 True 表示成功登記,False 表示因已有未決事件而被擱置。
     """
+    # 橋接擷取模式（Hermes 經 /ask 呼叫）下不建立待確認事件：這個模式的回覆是
+    # 回給 HTTP 呼叫端的，「若不用請喊停」那句話擁有者根本看不到，10 分鐘後
+    # watchdog 就把它當默認同意寫進不可逆的長期記錄。等於「待確認」這道防線在
+    # 擷取模式下完全不存在——而 Hermes 讀到的網頁文字是不可信輸入。
+    from tg.api import is_capturing
+    if is_capturing():
+        logger.warning(f"⚠️ [Pending Event] 擷取模式（橋接）不建立「{ev_type}」待確認事件；"
+                       f"登記類動作請由擁有者在 Telegram 直接操作。")
+        return False
     with _pending_lock:
         existing = PENDING_EVENTS.get(chat_id)  # 直查字典：已逾時待自動落檔者同樣不可覆蓋
         if existing:
@@ -73,6 +82,7 @@ def _set_pending_event(chat_id, ev_type, note):
         PENDING_EVENTS[chat_id] = {
             "type": ev_type,
             "note": note,
+            "crop_hint": crop_hint,   # 落檔時決定記到哪個作物，不能只靠備註字串
             "created_epoch": time.time(),
         }
         return True
@@ -104,7 +114,7 @@ def _apply_pending_event(ev) -> str:
     etype = ev["type"]
     note = ev.get("note", "")
     if etype == "harvest":
-        return record_harvest(note)
+        return record_harvest(note, crop_hint=ev.get("crop_hint", ""))
     if etype == "fertilizer":
         save_fertilizer_event(note or "使用者登記施肥")
         return f"🧪 已記錄施肥事件：{note}"
@@ -170,7 +180,17 @@ def classify_confirmation(text: str):
     t = (text or "").strip().lower()
     if not t:
         return "unclear"
-    if any(w in t for w in _DENY_WORDS):
+    # 否定側過去是「純子字串掃描」，跟肯定側的雙層防護嚴重不對稱。中文正反問句
+    # 內含否定詞（要不要⊃不要、需不需要⊃不需要、是不是⊃不是），使用者在確認窗
+    # 內問一句最自然的後續問題「那接下來要不要追肥？」，會被判成明確拒絕：待確認
+    # 的收成被永久丟棄，而且 handler 提前 return，問題本身也被吞掉。
+    if "?" in t or "？" in t:
+        return "unclear"          # 問句既不是確認也不是拒絕（與肯定側同一標準）
+    t_scan = t
+    for pattern in ("需不需要", "可不可以", "要不要", "用不用", "是不是",
+                    "對不對", "好不好", "能不能"):
+        t_scan = t_scan.replace(pattern, "")   # 長樣式排前面，避免被部分吃掉
+    if any(w in t_scan for w in _DENY_WORDS):
         return "no"
     # 第一層：去除結尾標點與語助詞後「整句完全等於」短確認詞
     t_norm = t.rstrip("!！。．.~～嘛呀啦喔哦 ")

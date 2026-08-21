@@ -137,12 +137,70 @@ def test_disease_two_pathway():
 # ======================================================================
 # 5. prompts 病害輸入的小工具
 # ======================================================================
+def test_crop_key_divergence():
+    section("作物鍵分歧：state 存自訂名、查詢用標準名，必須仍找得到")
+    from storage.state import find_tracked_crop
+    # 實際踩到的情境：龍鬚菜在被加進 CROP_GDD_DATABASE 之前就以自訂名註冊，
+    # state 裡是 '龍鬚菜'，但之後 match_crop_key('龍鬚菜') 回 '龍鬚菜 (Chayote Shoot)'
+    # → /crops 列得出來、/crop_done 與 tool_finish_crop 卻回報查無此作物，停不掉。
+    legacy = {"龍鬚菜": {"accumulated_gdd": 120.0, "active": True}}
+    check("state 存自訂名，用同名查得到", find_tracked_crop(legacy, "龍鬚菜") == "龍鬚菜")
+    check("state 存自訂名，用標準名也查得到",
+          find_tracked_crop(legacy, "龍鬚菜 (Chayote Shoot)") == "龍鬚菜")
+    # 反向：state 存標準名，使用者只講短名
+    canon = {"空心菜 (Water Spinach)": {"accumulated_gdd": 50.0, "active": True}}
+    check("state 存標準名，用短名查得到",
+          find_tracked_crop(canon, "空心菜") == "空心菜 (Water Spinach)")
+    check("查不存在的作物回 None", find_tracked_crop(canon, "草莓") is None)
+    check("空字典回 None", find_tracked_crop({}, "空心菜") is None)
+    check("空名稱回 None", find_tracked_crop(canon, "") is None)
+
+
+def test_confirmation_ab_questions():
+    section("確認語意：中文正反問句不得被當成取消")
+    from agent.pending import classify_confirmation as cc
+    # 使用者在確認窗內問最自然的後續問題，過去會被判成「明確拒絕」：
+    # 待確認的收成被丟棄、而且 handler 提前 return 把問題本身也吞掉。
+    check("『那接下來要不要追肥？』→ unclear", cc("那接下來要不要追肥？") == "unclear")
+    check("『是不是該收成了』→ unclear", cc("是不是該收成了") == "unclear")
+    check("『用不用施肥』→ unclear", cc("用不用施肥") == "unclear")
+    check("『需不需要澆水？』→ unclear", cc("需不需要澆水？") == "unclear")
+    # 真正的拒絕仍要判成 no
+    check("『不用了』→ no", cc("不用了") == "no")
+    check("『先不要記錄』→ no", cc("先不要記錄") == "no")
+    check("『算了』→ no", cc("算了") == "no")
+    # 肯定側不受影響
+    check("『好』→ yes", cc("好") == "yes")
+    check("『幫我記』→ yes", cc("幫我記") == "yes")
+
+
+def test_capture_mode_blocks_pending():
+    section("橋接擷取模式：不得建立會落檔的待確認事件")
+    from tg.api import start_capture, stop_capture
+    from agent.pending import _set_pending_event, clear_pending_event
+    # 擷取模式的回覆是回給 HTTP 呼叫端的，「若不用請喊停」擁有者看不到，
+    # 10 分鐘後就被 watchdog 當默認同意寫進不可逆記錄。
+    token = start_capture()
+    blocked = _set_pending_event(999001, "harvest", "x") is False
+    stop_capture(token)
+    check("擷取模式下建立待確認事件被拒絕", blocked)
+    ok = _set_pending_event(999002, "harvest", "x") is True
+    clear_pending_event(999002)
+    check("一般模式仍可建立", ok)
+
+
 def test_prompts_helpers():
     section("prompts 輔助（濕度解析／葉菜判定／高濕時數）")
     from agent.prompts import _parse_pct, _has_leafy_crop, _high_humidity_hours
     check("_parse_pct '99%' → 99.0", _parse_pct("99%") == 99.0)
     check("_parse_pct '無資訊' → None", _parse_pct("無資訊") is None)
     check("_parse_pct '22.5' → 22.5", _parse_pct("22.5") == 22.5)
+    # ⚠️ 真實格式：scrapers/agri.py 的 fmt() 必定產出 "22.0 ℃"／"99 %"。
+    # 這幾則以前全部缺席，導致「氣溫永遠解析失敗、病害預警整條死掉」逃過測試。
+    check("_parse_pct '25.3 ℃' → 25.3", _parse_pct("25.3 ℃") == 25.3)
+    check("_parse_pct '-2.0 ℃' → -2.0", _parse_pct("-2.0 ℃") == -2.0)
+    check("_parse_pct '99.0 %' → 99.0", _parse_pct("99.0 %") == 99.0)
+    check("_parse_pct '0.20 ds/m' → 0.2", _parse_pct("0.20 ds/m") == 0.2)
     check("葉菜判定：空心菜→True", _has_leafy_crop(["空心菜"]) is True)
     check("葉菜判定：純番茄→False", _has_leafy_crop(["番茄 (Tomato)"]) is False)
     check("葉菜判定：番茄+萵苣→True", _has_leafy_crop(["番茄 (Tomato)", "萵苣"]) is True)
@@ -338,6 +396,9 @@ def main():
     test_strip_links()
     test_threshold_guard()
     test_disease_two_pathway()
+    test_crop_key_divergence()
+    test_confirmation_ab_questions()
+    test_capture_mode_blocks_pending()
     test_prompts_helpers()
     test_science_sanity()
     test_disease_knowledge_link()

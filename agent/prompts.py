@@ -19,6 +19,7 @@
 # ======================================================================
 import datetime
 import json
+import re
 
 from config import now_taipei
 from storage.state import load_state
@@ -35,7 +36,7 @@ def has_severe_weather(weather_forecast: str) -> bool:
 def parse_sensor_block(sensor_data_json: str):
     """
     從 get_agriweather_data 的 JSON 回傳拆出組 prompt 所需的四段：
-    (感測讀數顯示字串, 灌溉建議, 施肥建議, 過去6小時趨勢)。
+    (感測讀數顯示字串, 灌溉建議, 施肥建議, 歷史區間趨勢)。
     解析失敗時感測顯示退回原字串、其餘欄位為「無數據」（定時推播與哨兵共用）。
     """
     sensor_display = sensor_data_json
@@ -46,7 +47,7 @@ def parse_sensor_block(sensor_data_json: str):
                    ("air_temperature", "air_humidity", "soil_temperature", "soil_humidity", "soil_ec")}
         irr_advice = d.get("irrigation_advice", "無數據")
         fert_advice = d.get("fertilization_advice", "無數據")
-        past_6h_text = d.get("past_6h_summary", "無數據")
+        past_6h_text = d.get("history_summary") or d.get("past_6h_summary", "無數據")
         sensor_display = json.dumps(sensors, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -54,16 +55,19 @@ def parse_sensor_block(sensor_data_json: str):
 
 
 def _parse_pct(val):
-    """把感測歷史/即時讀數裡的濕度字串（'99'、'99%'、'99.0'、'無資訊'）解析成 float，無效回 None。"""
+    """把感測讀數字串解析成 float，無效回 None。
+
+    支援 '99'、'99%'、'99.0 %'、'22.0 ℃'、'-2.5 ℃'；'無資訊' 因無數字而回 None。
+
+    ⚠️ 這裡曾經只剝 '%' 不剝 '℃'，而 scrapers/agri.py 的 fmt() 必定產出
+    '22.0 ℃'——氣溫因此永遠解析失敗，病害風險永遠是「未知」，葉部病害預警
+    整條靜默失效（sentinel 的 level=="高" 永遠不成立），同時 build_disease_report
+    還會謊稱「缺少實測」。改用抽第一個數字的作法，單位一律無關。
+    """
     if val is None:
         return None
-    try:
-        s = str(val).replace("%", "").strip()
-        if not s or "無" in s:
-            return None
-        return float(s)
-    except (ValueError, TypeError):
-        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(val))
+    return float(m.group()) if m else None
 
 
 # 非葉菜（多為果菜/根菜，葉部病害易感度較葉菜低）關鍵字
