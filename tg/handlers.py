@@ -43,7 +43,8 @@ from agent.session import (
     reset_chat, send_message_with_retry,
 )
 from agent.nvidia_fallback import generate_report_text
-from config import HEARTBEAT_FILE, HEARTBEAT_URL, TELEGRAM_CHAT_ID, redact
+from config import (DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, HEARTBEAT_FILE, HEARTBEAT_URL,
+                    TELEGRAM_CHAT_ID, WET_THRESHOLD_MAX, redact)
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE, lookup_crop_info
 from scrapers.cwa import get_et0_report
@@ -88,7 +89,7 @@ async def handle_local_command(chat_id, text) -> bool:
             "/disease — 葉部病害風險評估（高濕悶熱 × 適病溫區，事前預警）\n"
             "/kb 關鍵詞 — 直接檢索農業部出版品知識庫（例：/kb 空心菜 病害）\n"
             "/health — 系統健康狀態（爬蟲成功率、心跳）\n"
-            "/threshold dry=30 wet=80 — 手動設定土壤濕度警戒門檻（全園共用）\n"
+            "/threshold dry=20 wet=40 — 手動設定土壤濕度警戒門檻（體積含水率 %，全園共用）\n"
             "/crop 空心菜 — 設定對話焦點作物\n"
             "/reset — 清空 AI 對話歷史\n"
             "👇 輸入框下方常駐快捷鍵：「🌱 耕地快照」＝秒回現況（同 /status）、"
@@ -140,7 +141,7 @@ async def handle_local_command(chat_id, text) -> bool:
             f"📋 目前農園狀態\n"
             f"🌾 作物：{state.get('crop_name', '未設定')}\n"
             f"🌱 生長階段：{state.get('lifecycle', '未設定')}\n"
-            f"🚰 警戒門檻：乾燥 < {state.get('dry_threshold', 30.0)}% / 積水 > {state.get('wet_threshold', 80.0)}%\n"
+            f"🚰 警戒門檻：乾燥 < {state.get('dry_threshold', DEFAULT_DRY_THRESHOLD)}% / 積水 > {state.get('wet_threshold', DEFAULT_WET_THRESHOLD)}%\n"
             f"📡 最新感測讀數：{latest}"
         ))
         return True
@@ -246,16 +247,16 @@ async def handle_local_command(chat_id, text) -> bool:
         dry_m = re.search(r'dry\s*=\s*([0-9\.]+)', arg_text)
         wet_m = re.search(r'wet\s*=\s*([0-9\.]+)', arg_text)
         if not (dry_m and wet_m):
-            await send_telegram_message(chat_id, "用法：/threshold dry=30 wet=80")
+            await send_telegram_message(chat_id, "用法：/threshold dry=20 wet=40（體積含水率 %，積水門檻上限 60）")
             return True
         try:
             new_dry = float(dry_m.group(1))
             new_wet = float(wet_m.group(1))
         except ValueError:
-            await send_telegram_message(chat_id, "⚠️ 數值格式錯誤。用法：/threshold dry=30 wet=80")
+            await send_telegram_message(chat_id, "⚠️ 數值格式錯誤。用法：/threshold dry=20 wet=40")
             return True
-        if not (0.0 < new_dry < new_wet < 100.0):
-            await send_telegram_message(chat_id, f"⚠️ 設定被拒絕：必須滿足 0 < dry < wet < 100（收到 dry={new_dry}, wet={new_wet}）。")
+        if not (0.0 < new_dry < new_wet < WET_THRESHOLD_MAX):
+            await send_telegram_message(chat_id, f"⚠️ 設定被拒絕：必須滿足 0 < dry < wet < {WET_THRESHOLD_MAX}（收到 dry={new_dry}, wet={new_wet}）。土壤含水率是體積含水率，完全飽和也只有約 40~50%。")
             return True
         def _apply(state):
             state["dry_threshold"] = new_dry

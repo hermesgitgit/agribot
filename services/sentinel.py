@@ -32,7 +32,7 @@ from agent.prompts import (
 from science.disease import format_disease_report
 from agent.session import generate_oneshot_no_tools, generate_oneshot_with_retry, is_transient_api_error
 from agent.nvidia_fallback import generate_report_text
-from config import TELEGRAM_CHAT_ID, redact
+from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, TELEGRAM_CHAT_ID, redact
 from logging_setup import logger
 from scrapers.agri import get_agriweather_data
 from scrapers.cwa import fetch_cwa_observation, get_cwa_weather_forecast
@@ -66,8 +66,8 @@ async def hourly_safety_check_loop():
             
             # 1. 載入當前警戒門檻與生長階段 (Feature 4 自主微調閉環)
             state = load_state()
-            dry_threshold = state.get("dry_threshold", 30.0)
-            wet_threshold = state.get("wet_threshold", 80.0)
+            dry_threshold = state.get("dry_threshold", DEFAULT_DRY_THRESHOLD)
+            wet_threshold = state.get("wet_threshold", DEFAULT_WET_THRESHOLD)
             lifecycle = state.get("lifecycle", "幼苗期")
             
             # 2. 爬取阿龜即時數據 (這會自動存入歷史紀錄，使 history.json 高解析度化！)

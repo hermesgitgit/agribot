@@ -25,7 +25,7 @@ import re
 
 from agent.guard import MAX_THRESHOLD_STEP
 from agent.pending import _current_chat_ctx, _set_pending_event
-from config import now_taipei
+from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, WET_THRESHOLD_MAX, now_taipei
 from agent.prompts import build_disease_report, build_state_summary
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE, lookup_crop_info, match_crop_key
@@ -72,7 +72,7 @@ def tool_get_garden_status() -> str:
 
 
 def tool_set_thresholds(dry: float, wet: float, lifecycle_stage: str) -> str:
-    """調整本地哨兵系統的土壤濕度警戒門檻。dry=乾燥警戒%（低於即告警）、wet=積水警戒%（高於即告警）、lifecycle_stage=生長階段代碼（如 seedling/vegetative/flowering/mature）。安全限制：必須 0 < dry < wet < 100 且單次調幅不得超過±15個百分點，違反時會被拒絕並回傳原因。成功或失敗都會回傳結果訊息，請據此告知使用者。"""
+    """調整本地哨兵系統的土壤濕度警戒門檻。dry=乾燥警戒%（低於即告警）、wet=積水警戒%（高於即告警）、lifecycle_stage=生長階段代碼（如 seedling/vegetative/flowering/mature）。注意：土壤含水率是「體積含水率」，不是 0~100 的相對濕度——土壤完全飽和也只有約 40~50%，壤土田間容水量（澆透排水後的穩定值）約 20~30%，所以 wet 應設在該地飽和參考值略上方（通常 35~45），dry 設在凋萎點略上方（通常 15~25）。安全限制：必須 0 < dry < wet < 60 且單次調幅不得超過±15個百分點，違反時會被拒絕並回傳原因。成功或失敗都會回傳結果訊息，請據此告知使用者。"""
     try:
         new_dry = float(dry)
         new_wet = float(wet)
@@ -80,11 +80,11 @@ def tool_set_thresholds(dry: float, wet: float, lifecycle_stage: str) -> str:
         return "❌ 設定失敗：dry 與 wet 必須是數值。"
     if not re.fullmatch(r'\w{1,30}', str(lifecycle_stage) or ""):
         return "❌ 設定失敗：lifecycle_stage 僅允許 1~30 個英數字元。"
-    if not (0.0 < new_dry < new_wet < 100.0):
-        return f"❌ 設定被拒絕：必須滿足 0 < dry({new_dry}) < wet({new_wet}) < 100。"
+    if not (0.0 < new_dry < new_wet < WET_THRESHOLD_MAX):
+        return f"❌ 設定被拒絕：必須滿足 0 < dry({new_dry}) < wet({new_wet}) < {WET_THRESHOLD_MAX}（土壤含水率為體積含水率，物理上限約 40~50%）。"
     def _apply(state):
-        cur_dry = float(state.get("dry_threshold", 30.0))
-        cur_wet = float(state.get("wet_threshold", 80.0))
+        cur_dry = float(state.get("dry_threshold", DEFAULT_DRY_THRESHOLD))
+        cur_wet = float(state.get("wet_threshold", DEFAULT_WET_THRESHOLD))
         if abs(new_dry - cur_dry) > MAX_THRESHOLD_STEP or abs(new_wet - cur_wet) > MAX_THRESHOLD_STEP:
             return (f"❌ 設定被拒絕：單次調幅超過 ±{MAX_THRESHOLD_STEP} 百分點"
                     f"（目前 dry={cur_dry}, wet={cur_wet}）。請建議使用者以 /threshold 手動指令進行大幅調整。")

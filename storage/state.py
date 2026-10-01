@@ -20,7 +20,7 @@
 import json
 import os
 
-from config import STATE_FILE
+from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, STATE_FILE
 from logging_setup import logger
 from storage.common import STATE_FILE_LOCK, atomic_write_json
 
@@ -32,8 +32,8 @@ def load_state() -> dict:
     """
     default_state = {
         "lifecycle": "seedling (幼苗期)",
-        "dry_threshold": 30.0,
-        "wet_threshold": 80.0,
+        "dry_threshold": DEFAULT_DRY_THRESHOLD,
+        "wet_threshold": DEFAULT_WET_THRESHOLD,
         "crop_name": "番茄 (Tomato)",
         "crops": {
             "番茄 (Tomato)": {

@@ -23,6 +23,7 @@
 # AI 回覆中的連結一律攔截移除（Link Guard，縱深防禦）。
 import re
 
+from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, WET_THRESHOLD_MAX
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE
 from storage.state import update_state
@@ -35,7 +36,8 @@ def apply_threshold_command(ai_message: str, source_tag: str = "AI") -> str:
     """
     從 Gemini 回覆中攔截 [SET_THRESHOLD: ...] 指令，通過安全驗證才套用至 state.json，
     並回傳已清除隱藏標記的訊息文字。驗證規則：
-      1. 必須滿足 0 < dry < wet < 100（否則哨兵警報邏輯會永久觸發或永久失效）。
+      1. 必須滿足 0 < dry < wet < WET_THRESHOLD_MAX（體積含水率的物理上限約 40~50%，
+         門檻設到 100 等於永久失效；設 dry > wet 則永久觸發）。
       2. 單次調幅不得超過 ±MAX_THRESHOLD_STEP 個百分點（防範注入/幻覺一步到位地癱瘓監控；
          確需大幅調整時請使用 /threshold 手動指令）。
     不合規的指令一律丟棄並記錄 log，僅清除標記、不改寫任何狀態。
@@ -49,13 +51,13 @@ def apply_threshold_command(ai_message: str, source_tag: str = "AI") -> str:
         new_wet = float(threshold_match.group(2))
         new_state = threshold_match.group(3)
 
-        if not (0.0 < new_dry < new_wet < 100.0):
-            logger.warning(f"🛡️ [Command Guard] 拒絕 SET_THRESHOLD：數值不滿足 0 < dry({new_dry}) < wet({new_wet}) < 100。")
+        if not (0.0 < new_dry < new_wet < WET_THRESHOLD_MAX):
+            logger.warning(f"🛡️ [Command Guard] 拒絕 SET_THRESHOLD：數值不滿足 0 < dry({new_dry}) < wet({new_wet}) < {WET_THRESHOLD_MAX}（體積含水率上限）。")
             return cleaned
 
         def _apply(state):
-            cur_dry = float(state.get("dry_threshold", 30.0))
-            cur_wet = float(state.get("wet_threshold", 80.0))
+            cur_dry = float(state.get("dry_threshold", DEFAULT_DRY_THRESHOLD))
+            cur_wet = float(state.get("wet_threshold", DEFAULT_WET_THRESHOLD))
             if abs(new_dry - cur_dry) > MAX_THRESHOLD_STEP or abs(new_wet - cur_wet) > MAX_THRESHOLD_STEP:
                 logger.warning(f"🛡️ [Command Guard] 拒絕 SET_THRESHOLD：單次調幅超過 ±{MAX_THRESHOLD_STEP} 百分點 (dry {cur_dry}->{new_dry}, wet {cur_wet}->{new_wet})。")
                 return False

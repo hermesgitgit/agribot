@@ -21,7 +21,7 @@ import datetime
 import json
 import re
 
-from config import now_taipei
+from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, now_taipei
 from storage.state import load_state
 
 # 極端天氣關鍵字：定時推播與安全哨兵共用，命中即指示 AI 啟動主動防禦模式。
@@ -277,8 +277,9 @@ def build_state_summary() -> str:
         f"【目前農園監控狀態與作物設定】\n"
         f"- 當前焦點作物：{active_crop}（對話與門檻以此為主）\n"
         f"- 當前生長階段：{current_state.get('lifecycle', '幼苗期')}\n"
-        f"- 土壤乾燥警戒門檻：{current_state.get('dry_threshold', 30.0)}%（全園共用，土壤感測器只有一個）\n"
-        f"- 土壤積水警戒門檻：{current_state.get('wet_threshold', 80.0)}%\n"
+        f"- 土壤乾燥警戒門檻：{current_state.get('dry_threshold', DEFAULT_DRY_THRESHOLD)}%（全園共用，土壤感測器只有一個）\n"
+        f"- 土壤積水警戒門檻：{current_state.get('wet_threshold', DEFAULT_WET_THRESHOLD)}%\n"
+        f"- 註：土壤含水率是體積含水率，完全飽和約 40~50%、壤土澆透排水後穩定在 20~30%；本園實測澆透後約 27%，讀數不會升到 30 以上是正常的\n"
         f"- 在種作物的生長積溫（GDD）進度，共 {len(tracked)} 種：\n{crops_block}"
     )
 
@@ -329,7 +330,8 @@ SYSTEM_INSTRUCTION = """
    - **照片視覺評估登記（每次收到作物照片都要做）**：完成上述診斷後，呼叫 `tool_record_visual_assessment` 把這次的觀察登記成結構化視覺生長日誌：判定照片中作物（依圖說/你的辨識/焦點作物）、生長階段、生長勢 1~5、冠層覆蓋度 1~5、一句話健康觀察。系統會自動把你判定的「視覺階段」與「GDD 積溫推估的階段」交叉檢核並把結論回給你——**照片是現場真相、GDD 是模型預測**：若工具回報兩者背離（照片落後或超前於積溫推估），務必在回覆中向使用者點出這個落差並研判原因（落後常見於缺水/養分逆境、低溫、定植不良或病蟲害；超前可能代表此微氣候生長較快或目標積溫設偏高）。背景資訊若附有【視覺生長日誌】，請結合它看長期趨勢；需要時也可呼叫 `tool_query_visual_history` 查詢。這是「越拍越懂這塊地」的視覺校正迴路，與 GDD/預測自校正同一精神。
 8. **閉環自我控制——門檻調整工具**：
    - 作為具備自主性的 Agentic AI，你能動態調節現場的物理監控防護。當你透過「影像視覺診斷」或「對話內容」發現作物生長階段轉變（例如從幼苗期 seedling 成長為旺盛期 vegetative/mature），或評估氣候異常需要調整警戒線時，請直接呼叫 `tool_set_thresholds` 工具（參數：dry 乾燥警戒%、wet 積水警戒%、lifecycle_stage 階段代碼）。
-   - 安全限制：系統僅接受 0 < dry < wet < 100 且單次調幅 ≤ ±15 個百分點；被拒絕時工具會回傳原因，此時請改為建議使用者以 /threshold 手動指令設定。
+   - 安全限制：系統僅接受 0 < dry < wet < 60 且單次調幅 ≤ ±15 個百分點；被拒絕時工具會回傳原因，此時請改為建議使用者以 /threshold 手動指令設定。
+   - 物理常識：土壤含水率是「體積含水率」，不是相對濕度。土壤完全飽和也只有約 40~50%，壤土田間容水量約 20~30%。積水門檻應設在該地「澆透後的穩定讀數」略上方（通常 35~45），絕不要往 50 以上調；乾燥門檻設在凋萎點略上方（通常 15~25）。
    - 呼叫成功後，請在回覆中以一句話告知使用者你做了這項調整與理由（透明原則）。
 9. **融合阿龜平台原生建議進行二次評估與決策**：
    - 你將在 Context 中收到【阿龜物聯網平台 - 原生系統建議】（包括系統原生的灌溉建議與施肥建議）。這些建議是阿龜平台基於大數據或特定農業規則產生的。
