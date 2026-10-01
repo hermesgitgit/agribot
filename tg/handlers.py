@@ -21,6 +21,7 @@
 # 待確認攔截（判定使用者是在確認還是取消上一筆收成/施肥事件）、其餘交給 AI。
 # 照片會存檔並自動找 4–14 天前的舊照組成對照組做跨時生長診斷。
 import asyncio
+import json
 import io
 import re
 
@@ -44,9 +45,10 @@ from agent.session import (
 )
 from agent.nvidia_fallback import generate_report_text
 from config import (DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, HEARTBEAT_FILE, HEARTBEAT_URL,
-                    TELEGRAM_CHAT_ID, WET_THRESHOLD_MAX, redact)
+                    TELEGRAM_CHAT_ID, WET_THRESHOLD_MAX, now_taipei, redact)
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE, lookup_crop_info
+from scrapers.agri import get_agriweather_data
 from scrapers.cwa import get_et0_report
 from storage.events import load_fertilizer_events
 from storage.harvest import get_harvest_cadence_summary, record_harvest
@@ -92,7 +94,7 @@ async def handle_local_command(chat_id, text) -> bool:
             "/threshold dry=20 wet=40 — 手動設定土壤濕度警戒門檻（體積含水率 %，全園共用）\n"
             "/crop 空心菜 — 設定對話焦點作物\n"
             "/reset — 清空 AI 對話歷史\n"
-            "👇 輸入框下方常駐快捷鍵：「🌱 耕地快照」＝秒回現況（同 /status）、"
+            "👇 輸入框下方常駐快捷鍵：「🌱 耕地快照」＝即時抓感測讀數、不花 AI 額度（同 /status）、"
             "「🔍 完整分析」＝即時爬取後做完整 AI 評估、「🧪 已施肥」＝一鍵登記施肥（會先確認一次）。\n"
             "💬 也可以直接自然地告訴我「我收成了」「我施肥了」或上傳收成照片，"
             "我會幫你登記（登記前會跟你確認一次）。"
@@ -125,18 +127,35 @@ async def handle_local_command(chat_id, text) -> bool:
 
     if cmd == "/status":
         state = load_state()
-        latest = "尚無歷史感測記錄"
+        # 快照必須是「現在」的讀數：直接打阿龜 API 抓即時值（約 1~2 秒、零 AI 額度），
+        # 不再拿最近一筆歷史記錄充數——那是哨兵上一輪（最多一小時前）的快照。
+        # API 失敗才退回最近一筆歷史，並明確標示它是舊資料與時間。
+        def _fmt_reading(r, header):
+            return (
+                f"{header}\n"
+                f"  🌡️ 氣溫 {r.get('air_temperature', '—')} / 💧 空氣濕度 {r.get('air_humidity', '—')}\n"
+                f"  🎚️ 土溫 {r.get('soil_temperature', '—')} / 🌊 土壤濕度 {r.get('soil_humidity', '—')} / 🧪 EC {r.get('soil_ec', '—')}"
+            )
+        latest = None
         try:
-            recent = query_history_records(limit=1)
-            if recent:
-                r = recent[-1]
-                latest = (
-                    f"{r.get('timestamp', '')}\n"
-                    f"  🌡️ 氣溫 {r.get('air_temperature', '—')} / 💧 空氣濕度 {r.get('air_humidity', '—')}\n"
-                    f"  🎚️ 土溫 {r.get('soil_temperature', '—')} / 🌊 土壤濕度 {r.get('soil_humidity', '—')} / 🧪 EC {r.get('soil_ec', '—')}"
-                )
+            raw = await asyncio.to_thread(get_agriweather_data)
+            fresh = json.loads(raw)  # 成功時為 JSON；退化字串會在這裡拋 ValueError
+            sensor_keys = ("air_temperature", "air_humidity", "soil_temperature", "soil_humidity", "soil_ec")
+            if all(fresh.get(k, "無資訊") == "無資訊" for k in sensor_keys):
+                # 兩支 API 皆失敗時函式不拋錯、只回全「無資訊」的 JSON——不能標成「即時」
+                raise ValueError("兩支 API 皆無有效感測值")
+            latest = _fmt_reading(fresh, f"即時（{now_taipei().strftime('%H:%M')} 剛抓取）")
         except Exception as e:
-            latest = f"讀取失敗: {e}"
+            logger.warning(f"⚠️ [/status] 即時感測抓取失敗，退回最近一筆歷史: {redact(str(e))}")
+        if latest is None:
+            latest = "即時抓取失敗，且尚無歷史感測記錄"
+            try:
+                recent = query_history_records(limit=1)
+                if recent:
+                    r = recent[-1]
+                    latest = _fmt_reading(r, f"⚠️ 即時抓取失敗，以下是最近一筆歷史記錄（{r.get('timestamp', '')}），非現況")
+            except Exception as e:
+                latest = f"讀取失敗: {e}"
         await send_telegram_message(chat_id, (
             f"📋 目前農園狀態\n"
             f"🌾 作物：{state.get('crop_name', '未設定')}\n"
@@ -365,14 +384,18 @@ async def handle_message(message):
 
     # 🌱 耕地狀況快捷按鍵（輸入框下方常駐 reply keyboard）
     if not photo and text == BTN_SNAPSHOT:
-        # 耕地快照：直接走本地 /status，秒回、不爬新數據、零 AI 額度
+        # 耕地快照：直接走本地 /status，即時抓感測讀數、零 AI 額度
         await handle_local_command(chat_id, "/status")
         return
+    force_fresh_sensor = False
     if not photo and text == BTN_FULL_ANALYSIS:
-        # 完整分析：等同使用者輸入「現在耕地的狀況如何？」，往下交由 AI
-        # 即時爬取後分析。改寫 text/user_input_text 後讓流程照常進行。
+        # 完整分析：等同使用者輸入「現在耕地的狀況如何？」，往下交由 AI 分析。
+        # 按鈕的承諾是「即時爬取後評估」，這不該取決於模型這一輪有沒有自覺去呼叫
+        # 感測工具——實測過 Gemini 會直接照抄背景裡「最近一次推播」的舊數據回答。
+        # 故由系統確定性先抓即時感測、注入 prompt（與「已施肥」按鈕焊死的做法一致）。
         text = FARM_STATUS_QUESTION
         user_input_text = FARM_STATUS_QUESTION
+        force_fresh_sensor = True
     if not photo and text == BTN_FERTILIZED:
         # 已施肥：按鈕的意圖是明確且固定的，不該取決於某個模型這一輪有沒有
         # 呼叫工具。過去這裡改寫成一句話交給 AI，Gemini 壅塞時會退到不帶工具
@@ -421,7 +444,7 @@ async def handle_message(message):
             chat_id,
             "🌱 歡迎使用智慧農務 Agentic Bot！已為您清空對話歷史，現在可以重新設定或詢問囉！\n"
             "例如：「我現在剛種了空心菜幼苗，今天需要澆水嗎？」\n"
-            "👇 輸入框下方有兩顆快捷鍵：「🌱 耕地快照」秒回現況、「🔍 完整分析」做即時完整評估。\n"
+            "👇 輸入框下方有兩顆快捷鍵：「🌱 耕地快照」即時讀數不經 AI、「🔍 完整分析」即時抓數據後做完整 AI 評估。\n"
             "輸入 /help 可查看本地快速指令（查狀態、查積溫、手動設門檻，即時回覆且不耗 AI 額度）。",
             reply_markup=FARM_KEYBOARD
         )
@@ -501,6 +524,16 @@ async def handle_message(message):
         prediction_feedback = load_prediction_feedback()
         state_summary = build_state_summary()
         last_push_brief = load_last_push_brief()
+        fresh_sensor_block = ""
+        if force_fresh_sensor:
+            try:
+                fresh = await asyncio.to_thread(get_agriweather_data)
+                fresh_sensor_block = (
+                    "【系統剛為本題抓取的即時感測數據（這才是現況，請直接據此分析，不必再呼叫感測工具）】\n"
+                    f"{fresh}\n\n"
+                )
+            except Exception as fresh_err:
+                logger.warning(f"⚠️ [完整分析] 即時感測預抓失敗，退回由模型自行呼叫工具: {redact(str(fresh_err))}")
 
         # 構建多模態 Prompt
         prompt_parts = []
@@ -550,6 +583,7 @@ async def handle_message(message):
             f"不要套用農務報告格式；若是農務問題，再參考以下背景與工具進行分析。）{fresh_note}\n\n"
             f"【系統背景資訊 - {time_context}】\n\n"
             f"{state_summary}\n\n"
+            + fresh_sensor_block
             + (f"{last_push_brief}\n\n" if last_push_brief else "")
             + f"{fertilizer_summary}\n\n"
             f"{prediction_feedback}\n\n"

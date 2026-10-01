@@ -22,12 +22,13 @@
 # 會自然地對著推播內容追問（「剛剛說的蟲害是怎麼回事？」）。
 # 解法（輕量版）：每次主動推播後記下時間與摘要，對話時注入 prompt，
 # 讓對話腦至少知道推播腦最近說過什麼。
+import datetime
 import json
 import os
 import re
 import time
 
-from config import HERMES_OUTBOX_DIR, LAST_PUSH_FILE, now_taipei
+from config import HERMES_OUTBOX_DIR, LAST_PUSH_FILE, TZ_TAIPEI, now_taipei
 from logging_setup import logger
 from storage.common import STATE_FILE_LOCK, atomic_write_json
 
@@ -87,9 +88,21 @@ def load_last_push_brief() -> str:
         with STATE_FILE_LOCK:
             with open(LAST_PUSH_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
+        # 時效標記：推播裡的感測數值與警戒門檻是「當時」的快照，之後門檻可能已被
+        # 手動或 AI 改過、數據也早就變了。實測過 Gemini 會直接照抄這段當作現況回答
+        # （連早上的氣溫和舊門檻一起抄），所以明說它只能用來理解使用者在指哪則推播。
+        age_text = "時間不明"
+        try:
+            ts = datetime.datetime.strptime(d.get("ts", ""), "%Y-%m-%d %H:%M").replace(tzinfo=TZ_TAIPEI)
+            mins = max(0, int((now_taipei() - ts).total_seconds() // 60))
+            age_text = f"{mins} 分鐘前" if mins < 120 else f"約 {mins // 60} 小時前"
+        except ValueError:
+            pass
         return (
-            f"【系統最近一次主動推播（{d.get('ts', '?')}，{d.get('kind', '推播')}）的內容摘要——"
-            f"使用者若提到「剛剛的推播／報告／警報」即是指這則】\n{d.get('summary', '')}"
+            f"【系統最近一次主動推播（{d.get('ts', '?')}，{age_text}，{d.get('kind', '推播')}）的內容摘要——"
+            f"僅供理解使用者提到「剛剛的推播／報告／警報」時是指哪一則。"
+            f"注意：這是過去的快照，其中的感測數值與警戒門檻可能已過時；"
+            f"回答「現況」一律以本輪即時感測數據與上方【目前農園監控狀態】的門檻為準，不得引用這裡的數字】\n{d.get('summary', '')}"
         )
     except Exception as e:
         logger.warning(f"⚠️ [Push Log] 讀取推播摘要失敗: {e}")
