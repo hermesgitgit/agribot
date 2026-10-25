@@ -315,6 +315,48 @@ def test_kb_context():
     os.unlink(db)
 
 
+def test_cwa_alerts():
+    section("CWA 警特報（parse/format/has_severe_weather 連動）")
+    from scrapers.cwa import parse_cwa_alerts, format_cwa_alerts, get_cwa_alerts_report
+    from agent.prompts import has_severe_weather
+    hz = {"records": {"location": [{"locationName": "臺北市", "hazardConditions": {"hazards": [
+        {"info": {"phenomena": "海上陸上颱風", "significance": "警報"},
+         "validTime": {"startTime": "2026-10-23 18:15:00", "endTime": "2026-10-23 22:15:00"}},
+        {"info": {"phenomena": "豪雨", "significance": "特報"},
+         "validTime": {"startTime": "2026-10-23 09:40:00", "endTime": "2026-10-24 09:40:00"}},
+        {"info": {"phenomena": "", "significance": "特報"}, "validTime": {}},
+    ]}}]}}
+    ty = {"records": {"TropicalCyclones": {"TropicalCyclone": [
+        {"CwaTyNo": 29, "TyphoonName": "CHAMPI", "CwaTyphoonName": "薔琵",
+         "AnalysisData": {"Fix": [
+             {"DateTime": "2026-10-14T08:00:00+08:00", "MaxWindSpeed": 12},
+             {"DateTime": "2026-10-23T17:00:00+08:00", "CoordinateLatitude": 24.2,
+              "CoordinateLongitude": 122.6, "MaxWindSpeed": 43, "MaxGustSpeed": 53,
+              "Pressure": 945, "MovingDirection": "W", "MovingSpeed": 7}]}}]}}}
+    a = parse_cwa_alerts(hz, ty)
+    check("特報解析：空 phenomena 被略過、留 2 筆", len(a["hazards"]) == 2, str(a["hazards"]))
+    check("特報時間格式化", a["hazards"][0]["start"] == "10/23 18:15", a["hazards"][0]["start"])
+    check("颱風取最新一筆定位", a["typhoons"][0]["wind"] == 43 and a["typhoons"][0]["time"] == "10/23 17:00", str(a["typhoons"]))
+    txt = format_cwa_alerts(a)
+    check("文字含颱風警報與豪雨特報", "海上陸上颱風警報" in txt and "豪雨特報" in txt, txt)
+    check("文字含颱風現況", "薔琵" in txt and "945" in txt, txt)
+    check("has_severe_weather 對警示文字為 True", has_severe_weather(txt))
+    none_txt = format_cwa_alerts({"hazards": [], "typhoons": []})
+    check("無警示文案不觸發 has_severe_weather", not has_severe_weather(none_txt), none_txt)
+    check("空 JSON 容忍", parse_cwa_alerts({}, {}) == {"hazards": [], "typhoons": []})
+    import scrapers.cwa as C
+    old = C.CWA_API_KEY
+    try:
+        C.CWA_API_KEY = ""
+        C._ALERT_CACHE.update(ts=0.0, data=None)
+        rep = get_cwa_alerts_report()
+        check("沒金鑰→誠實說查詢失敗", "查詢失敗" in rep, rep)
+        check("查詢失敗文案不觸發 has_severe_weather（防哨兵誤推）", not has_severe_weather(rep), rep)
+    finally:
+        C.CWA_API_KEY = old
+        C._ALERT_CACHE.update(ts=0.0, data=None)
+
+
 def test_report_resilience():
     section("generate_report_resilient（帶工具崩潰→無工具重產）")
     from agent.resilience import generate_report_resilient
@@ -404,6 +446,7 @@ def main():
     test_disease_knowledge_link()
     test_recent_rain()
     test_kb_context()
+    test_cwa_alerts()
     test_report_resilience()
     print_model_checklist()
     print(f"\n===== 結果：{_PASS} 通過 / {_FAIL} 失敗 =====")

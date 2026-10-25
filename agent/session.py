@@ -41,7 +41,11 @@ from agent.tools import AGENT_TOOLS
 from config import GEMINI_API_KEY, now_taipei
 from logging_setup import logger
 
-MODEL_NAME = "gemini-2.5-flash"
+# 2026-10-23 模型升級：對話／哨兵／照片診斷走 3.8 Flash（現行同級、年底前促銷價）；
+# 一天五次的定時報告量小、最需要推理品質，改走 3.1 Pro（preview 是目前唯一的 Pro ID）。
+# 估算：報告每則約 2 萬 token 進、1.5 千出 → 每月約 NT$300。哨兵每小時可能觸發，留在 Flash。
+MODEL_NAME = "gemini-3.8-flash"
+REPORT_MODEL_NAME = "gemini-3.1-pro-preview"
 AFC_MAX_CALLS = 10  # 單輪 ReAct 迴路最多自動執行幾次工具呼叫（防失控連環呼叫）
 
 _client = genai.Client(api_key=GEMINI_API_KEY)
@@ -107,14 +111,15 @@ def send_message_with_retry(chat, prompt, max_retries=3, delay=65):
     return _call_with_retry(lambda: chat.send_message(prompt), max_retries, delay)
 
 
-def generate_oneshot_with_retry(prompt_parts, max_retries=3, delay=65):
+def generate_oneshot_with_retry(prompt_parts, max_retries=3, delay=65, model=None):
     """
     無狀態的一次性 agentic 呼叫，供定時推播與安全哨兵使用：
     建立帶工具的臨時 chat，送出單一訊息後即丟棄——模型在這一輪內仍可自主
     呼叫工具進行多步調查，但不留任何跨輪 context。自動重試 429 並指數退避。
+    model 省略＝MODEL_NAME；定時報告傳 REPORT_MODEL_NAME。
     """
     def _do():
-        chat = _client.chats.create(model=MODEL_NAME, config=_AGENT_CONFIG)
+        chat = _client.chats.create(model=model or MODEL_NAME, config=_AGENT_CONFIG)
         return chat.send_message(prompt_parts)
     return _call_with_retry(_do, max_retries, delay)
 
@@ -137,15 +142,15 @@ def generate_oneshot_single_tool(prompt_parts, tool_fn, max_retries=3, delay=65)
         max_retries, delay)
 
 
-def generate_oneshot_no_tools(prompt_parts, max_retries=3, delay=65):
+def generate_oneshot_no_tools(prompt_parts, max_retries=3, delay=65, model=None):
     """
     無狀態、且「不帶工具」的一次性呼叫。用於防呆重試：當帶工具的呼叫
     漏掉分析本體時，以純文字模式強制模型直接產出文字報告——沒有工具可呼叫，
-    它就只能把分析寫出來。
+    它就只能把分析寫出來。model 省略＝MODEL_NAME。
     """
     return _call_with_retry(
         lambda: _client.models.generate_content(
-            model=MODEL_NAME, contents=prompt_parts, config=_NO_TOOLS_CONFIG),
+            model=model or MODEL_NAME, contents=prompt_parts, config=_NO_TOOLS_CONFIG),
         max_retries, delay)
 
 

@@ -32,7 +32,7 @@ from science.gdd import CROP_GDD_DATABASE, lookup_crop_info, match_crop_key
 from science.vision import crosscheck_stage
 from science.water import growth_stage
 from scrapers.agri import get_agriweather_data
-from scrapers.cwa import get_cwa_weather_forecast, get_et0_report
+from scrapers.cwa import get_cwa_alerts_report, get_cwa_weather_forecast, get_et0_report
 from storage.harvest import get_harvest_cadence_summary
 from storage.knowledge import search_knowledge
 from storage.history import load_history_summary
@@ -48,8 +48,13 @@ def tool_get_realtime_sensor_data() -> str:
 
 
 def tool_get_weather_forecast() -> str:
-    """抓取中央氣象署對使用者耕地所在地（台北市文山區）的最新天氣預報，包含溫度、降雨機率與天氣描述。耗時約30~60秒。判斷未來澆水排程、極端天氣防護時呼叫。回傳預報文字。"""
+    """抓取中央氣象署對使用者耕地所在地（台北市文山區）的最新一週天氣預報（溫度、降雨機率、天氣描述），回傳開頭會先附上目前生效中的警特報（颱風警報、豪雨特報等）。耗時約30~60秒。判斷未來澆水排程、極端天氣防護時呼叫。只想知道有沒有颱風或特報時改呼叫 tool_get_weather_alerts（數秒）。回傳預報文字。"""
     return get_cwa_weather_forecast()
+
+
+def tool_get_weather_alerts() -> str:
+    """查詢中央氣象署目前「生效中」的警特報：颱風警報（海警/陸警）、豪雨/大雨特報、強風、低溫等，以及西北太平洋活動中颱風的最新中心位置與強度。開放資料 API，數秒回應。使用者問「有沒有颱風」「現在有什麼特報」、或要做極端天氣防護判斷時呼叫。這是颱風／特報問題的唯一權威來源，一週預報文字不會含這些資訊。回傳文字。"""
+    return get_cwa_alerts_report()
 
 
 def tool_query_recent_history() -> str:
@@ -246,6 +251,7 @@ def tool_assess_disease_risk() -> str:
 AGENT_TOOLS = [
     tool_get_realtime_sensor_data,
     tool_get_weather_forecast,
+    tool_get_weather_alerts,
     tool_query_recent_history,
     tool_query_daily_summaries,
     tool_get_garden_status,

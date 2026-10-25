@@ -65,6 +65,11 @@ CWA_STATION_NAME = "文山(博嘉國小)"
 CWA_STATION_LAT = 25.0024        # 緯度（ET₀ 輻射計算需要）
 CWA_STATION_LON = 121.5757
 CWA_OBS_API = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001"
+# 警特報（2026-10-23 加）：一週預報的文字永遠不會出現「颱風」「豪雨特報」，那是另外兩個資料集——
+# W-C0033-001 各縣市生效中天氣警特報、W-C0034-005 颱風消息與警報。颱風天 bot 曾因此說「沒有颱風」。
+CWA_HAZARD_API = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/W-C0033-001"
+CWA_TYPHOON_API = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/W-C0034-005"
+CWA_HAZARD_LOCATION = "臺北市"      # 警特報以縣市為單位（文山區屬臺北市）
 
 # ----------------------------------------------------------------------
 # 土壤濕度警戒門檻（體積含水率 %，非 0~100 的相對濕度）

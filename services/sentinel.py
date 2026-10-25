@@ -35,7 +35,7 @@ from agent.nvidia_fallback import generate_report_text
 from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, TELEGRAM_CHAT_ID, redact
 from logging_setup import logger
 from scrapers.agri import get_agriweather_data
-from scrapers.cwa import fetch_cwa_observation, get_cwa_weather_forecast
+from scrapers.cwa import fetch_cwa_observation, get_cwa_alerts_report, get_cwa_weather_forecast
 from storage.events import load_fertilizer_events
 from storage.pushlog import record_push
 from storage.rain import record_rain
@@ -51,7 +51,9 @@ async def hourly_safety_check_loop():
         "soil_dry": 0.0,
         "soil_wet": 0.0,
         "soil_ec_high": 0.0,
-        "disease_high": 0.0
+        "disease_high": 0.0,
+        "weather": 0.0,        # 氣象警特報（颱風警報/豪雨特報…）
+        "weather_sig": ""      # 上次推播的警示內容，內容變了才視為新事件
     }
     ALERT_COOL_DOWN = 43200  # 12 小時 (秒)
     
@@ -111,6 +113,22 @@ async def hourly_safety_check_loop():
                     trigger_alerts.append(f"【⚠️ 積水警報】：目前土壤濕度高達 {soil_hum_val}%，高於安全警戒值 {wet_threshold}%！請防範根部缺氧爛根。(目前生長階段：{lifecycle})")
                     last_alert_sent["soil_wet"] = current_time
                     
+            # 🚨 狀況 W: 氣象警特報（颱風警報、豪雨特報…）。開放資料 API 數秒回應、每小時掃一次；
+            # 以前只掃一週預報文字，颱風天也掃不到「颱風」兩字（2026-10-23 薔琵實例）。
+            # 同一組警示 12 小時內不重發；警示內容變了（例如海警升陸警）視為新事件立即推。
+            try:
+                alerts_text = await asyncio.to_thread(get_cwa_alerts_report)
+            except Exception as alert_err:
+                alerts_text = ""
+                logger.warning(f"⚠️ [Sentinel] 警特報查詢失敗: {redact(str(alert_err))}")
+            if alerts_text and has_severe_weather(alerts_text):
+                sig = alerts_text.split("\n", 1)[-1]          # 去掉標題行，只比內容
+                if (sig != last_alert_sent.get("weather_sig")
+                        or current_time - last_alert_sent["weather"] > ALERT_COOL_DOWN):
+                    trigger_alerts.append(f"【⚠️ 氣象警示】中央氣象署目前有生效中的警特報：\n{alerts_text}")
+                    last_alert_sent["weather"] = current_time
+                    last_alert_sent["weather_sig"] = sig
+
             # 🚨 狀況 C: 電導度 EC 過高 (肥傷/鹽害預警，高於 1.8 ds/m)
             if soil_ec_val is not None and soil_ec_val > 1.8:
                 if current_time - last_alert_sent["soil_ec_high"] > ALERT_COOL_DOWN:

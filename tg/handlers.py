@@ -546,11 +546,14 @@ async def handle_message(message):
 
         if photo:
             if past_pil_image:
-                user_block = f"使用者上傳了照片（已附上兩張作物照片：第一張是歷史照片、第二張是最新照片），並附帶文字說明：{user_input_text if user_input_text else '請幫我對比生長狀況並診斷。'}"
+                user_block = f"使用者上傳了圖片（已附上兩張：第一張是系統從相簿找出的歷史照片、第二張是這次上傳的），並附帶文字說明：{user_input_text if user_input_text else '（沒有文字說明）'}"
             else:
-                user_block = f"使用者上傳了當前最新照片，並附帶文字說明：{user_input_text if user_input_text else '請幫我診斷這張照片中的作物狀況並給予建議。'}"
-            user_block += "\n（注意：若使用者的文字說明顯示這是一張『收成照片』、或提到他採收/割收了，請依準則 14 呼叫 tool_record_harvest_event 登記收成；若只是生長診斷或病蟲害照片，則正常診斷、不要登記。）"
-            user_block += "\n（診斷後請依準則 7 呼叫 tool_record_visual_assessment 登記這次的結構化視覺評估，並依工具回傳的「視覺 vs GDD 交叉檢核」結論在回覆中點出落差。）"
+                user_block = f"使用者上傳了一張圖片，並附帶文字說明：{user_input_text if user_input_text else '（沒有文字說明）'}"
+            user_block += ("\n（第一步先依準則 7 判斷圖片類型：作物／田地實拍照才做作物診斷；"
+                           "截圖、文件、氣象特報圖等直接讀內容回應，不登記視覺評估、不做 GDD 交叉檢核。"
+                           "歷史照片只在這次也是作物照時才拿來對比。）")
+            user_block += "\n（若是作物照：使用者的文字說明顯示這是一張『收成照片』、或提到他採收/割收了，請依準則 14 呼叫 tool_record_harvest_event 登記收成；若只是生長診斷或病蟲害照片，則正常診斷、不要登記。）"
+            user_block += "\n（若是作物照：診斷後請依準則 7 呼叫 tool_record_visual_assessment 登記這次的結構化視覺評估，並依工具回傳的「視覺 vs GDD 交叉檢核」結論在回覆中點出落差。）"
             # 附上過往視覺日誌，讓 AI 看出長期趨勢
             vh = load_visual_history(n=6)
             if "尚無" not in vh:

@@ -21,6 +21,7 @@
 # 含極端天氣防禦模式與回應過短的防呆重試；報告送出後另起一次「聚焦呼叫」
 # 登記隔日可驗證預測，驅動自我校正迴路。
 import asyncio
+import functools
 from datetime import timedelta
 
 from agent.guard import apply_crop_command, apply_threshold_command, strip_links
@@ -29,6 +30,7 @@ from agent.prompts import (
     has_severe_weather, parse_sensor_block,
 )
 from agent.session import (
+    REPORT_MODEL_NAME,
     generate_oneshot_no_tools, generate_oneshot_single_tool,
     generate_oneshot_with_retry, is_transient_api_error,
 )
@@ -140,9 +142,11 @@ async def trigger_scheduled_push():
         logger.info("⏰ [Scheduled] 正在調用 Gemini 進行定時自動分析 (無狀態一次性呼叫)...")
         # 帶工具產報告；非壅塞性崩潰（如模型亂叫工具名→AFC KeyError）→ 退無工具純文字重產；
         # 壅塞性錯誤則往外拋，由外層備援模型接手。
+        # 定時報告走 REPORT_MODEL_NAME（Pro）：量小、最需要推理品質；哨兵與對話仍用 Flash。
+        gen_tools = functools.partial(generate_oneshot_with_retry, model=REPORT_MODEL_NAME)
+        gen_plain = functools.partial(generate_oneshot_no_tools, model=REPORT_MODEL_NAME)
         response = await asyncio.to_thread(
-            generate_report_resilient, prompt,
-            generate_oneshot_with_retry, generate_oneshot_no_tools, is_transient_api_error)
+            generate_report_resilient, prompt, gen_tools, gen_plain, is_transient_api_error)
         ai_message = (response.text or "").strip()
         
         # 防呆：若回應過短或缺標題（疑似模型跑去呼叫工具而漏掉報告本體），
@@ -157,7 +161,7 @@ async def trigger_scheduled_push():
                 "\n\n【重要】請直接輸出上述四部分的完整農務分析報告本身，不要呼叫任何工具。"
             )
             try:
-                retry_resp = await asyncio.to_thread(generate_oneshot_no_tools, retry_prompt)
+                retry_resp = await asyncio.to_thread(gen_plain, retry_prompt)
                 retry_text = (retry_resp.text or "").strip()
                 if len(retry_text) > len(ai_message):
                     ai_message = retry_text
