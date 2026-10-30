@@ -34,6 +34,45 @@ import datetime
 HARVEST_MIN_SAMPLES = 4  # 再生週期達此樣本數才視為「可信」而非「初步觀察」
 HARVEST_RECENT_WINDOW = 3  # 「近期週期」採計最近幾次再生間隔
 
+# 成熟目標積溫的「自我校準」：CROP_GDD_DATABASE 的 target_gdd 只是粗估，各家文獻
+# 的基溫又不一致，無法直接抄。最可靠的是園子自己的實收：每一輪從 /sow 播種起算，
+# 首次採收時累計到的 GDD 就是這塊地、這個品種的「真實成熟積溫」樣本。
+MATURITY_MIN_SAMPLES = 2          # 至少兩輪實收才敢提建議
+MATURITY_SUGGEST_TOLERANCE = 0.10  # 中位數與目前目標差超過 10% 才建議更新
+
+
+def median(xs):
+    if not xs:
+        return None
+    ys = sorted(xs)
+    n = len(ys)
+    mid = n // 2
+    return round(ys[mid] if n % 2 else (ys[mid - 1] + ys[mid]) / 2.0, 1)
+
+
+def maturity_calibration(samples, current_target, crop_name=""):
+    """
+    用「每輪首採時的累計 GDD」樣本校準成熟目標。samples 為各輪的 GDD（由舊到新），
+    current_target 為目前生效的目標。回傳 (說明文字, 建議目標或 None)。
+    只建議、不自動套用：目標改了會連動 Kc 生長階段與需水估算，應由使用者決定。
+    """
+    if not samples:
+        return "", None
+    n = len(samples)
+    med = median(samples)
+    if n < MATURITY_MIN_SAMPLES:
+        return (f"📐 首採積溫樣本 {n} 輪（{samples[-1]} ℃-day）；再多一輪實收就能校準目標積溫。"), None
+    lo, hi = round(min(samples), 1), round(max(samples), 1)
+    base = f"📐 依你自己 {n} 輪實收，{crop_name or '此作物'}首採積溫中位數約 {med} ℃-day（範圍 {lo}~{hi}）"
+    if not current_target:
+        return base + "。", med
+    diff = (med - float(current_target)) / float(current_target)
+    if abs(diff) <= MATURITY_SUGGEST_TOLERANCE:
+        return base + f"，與目前目標 {current_target} 相符，不需調整。", None
+    direction = "偏高" if diff > 0 else "偏低"
+    return (base + f"，比目前目標 {current_target} {direction} {abs(round(diff * 100))}%。"
+            f"建議改用 /target {crop_name.split()[0] if crop_name else '作物'} {int(round(med))} 更新目標。"), med
+
 
 def mean(xs):
     return round(sum(xs) / len(xs), 1) if xs else None

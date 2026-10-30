@@ -163,6 +163,91 @@ def set_crop_tracking(crop_name: str, active: bool):
     return key, acc
 
 
+def crop_target_gdd(state, crop_key, info=None) -> float:
+    """
+    某作物「目前生效」的成熟目標積溫：使用者用 /target（或實收校準後）設定的
+    自訂值優先，否則用 CROP_GDD_DATABASE 的粗估值。所有讀目標的地方一律經此，
+    否則 /gdd、推播、Kc 需水估算會各說各話。
+    """
+    entry = state.get("crops", {}).get(crop_key, {})
+    if isinstance(entry, dict):
+        try:
+            custom = entry.get("target_gdd")
+            if custom is not None and float(custom) > 0:
+                return float(custom)
+        except (TypeError, ValueError):
+            pass
+    if info is None:
+        from science.gdd import lookup_crop_info  # 延遲匯入避免 storage→science 載入期耦合
+        _, info = lookup_crop_info(crop_key)
+    return float(info.get("target_gdd", 1000.0))
+
+
+def start_crop_cycle(crop_name: str, note: str = "", today: str = None):
+    """
+    播種／定植：為某作物開始新的一輪——累計 GDD 歸零、記下 cycle_start_date、
+    納入每日追蹤。這是「首採積溫校準」的前提：沒有起算點，累計值就只是從
+    不知哪天起的總和，拿來當成熟積溫沒有意義。
+    上一輪的累計與起算日存進 prev_cycle，誤按可查、可手動還原。
+    回傳 (實際作物鍵, 上一輪累計 GDD, 上一輪起算日或 '')。
+    """
+    import datetime
+    from config import TZ_TAIPEI
+    from science.gdd import match_crop_key  # 延遲匯入避免 storage→science 載入期耦合
+    today = today or datetime.datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d")
+    raw = str(crop_name or "").strip()[:40]
+    canonical = match_crop_key(raw)
+
+    def _apply(state):
+        crops = state.setdefault("crops", {})
+        key = find_tracked_crop(crops, raw) or canonical
+        entry = crops.get(key)
+        if not isinstance(entry, dict):
+            acc_old = float(entry) if isinstance(entry, (int, float)) else 0.0
+            entry = {"accumulated_gdd": acc_old, "last_gdd_date": ""}
+            crops[key] = entry
+        old_acc = float(entry.get("accumulated_gdd", 0.0) or 0.0)
+        old_start = entry.get("cycle_start_date", "") or ""
+        entry["prev_cycle"] = {"accumulated_gdd": old_acc, "cycle_start_date": old_start, "ended": today}
+        entry["accumulated_gdd"] = 0.0
+        # 從今天起算：昨天以前不補結算（last_gdd_date=昨天 → 引擎明晚只結算今天）
+        yesterday = (datetime.datetime.strptime(today, "%Y-%m-%d") - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        entry["last_gdd_date"] = yesterday
+        entry["cycle_start_date"] = today
+        entry["cycle_note"] = str(note or "")[:60]
+        entry["active"] = True
+        return (key, old_acc, old_start)
+
+    return update_state(_apply)
+
+
+def set_crop_target(crop_name: str, target):
+    """
+    設定／清除某作物的自訂成熟目標積溫。target 為 None 表示清除、回到資料庫預設。
+    回傳 (實際作物鍵, 生效後的目標, 是否找到作物)。
+    """
+    from science.gdd import lookup_crop_info, match_crop_key  # 延遲匯入
+    raw = str(crop_name or "").strip()[:40]
+
+    def _apply(state):
+        crops = state.setdefault("crops", {})
+        key = find_tracked_crop(crops, raw)
+        if key is None:
+            return (match_crop_key(raw), None, False)
+        entry = crops.get(key)
+        if not isinstance(entry, dict):
+            entry = {"accumulated_gdd": float(entry or 0.0), "last_gdd_date": ""}
+            crops[key] = entry
+        if target is None:
+            entry.pop("target_gdd", None)
+        else:
+            entry["target_gdd"] = round(float(target), 1)
+        _, info = lookup_crop_info(key)
+        return (key, crop_target_gdd(state, key, info), True)
+
+    return update_state(_apply)
+
+
 def save_state(state_dict):
     """
     將最新狀態保存至 state.json（持鎖 + 原子寫入，防止併發覆蓋與半截毀檔）。

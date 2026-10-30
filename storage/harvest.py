@@ -23,9 +23,10 @@ import sqlite3
 
 from config import DB_FILE, TZ_TAIPEI
 from logging_setup import logger
-from science.cadence import cadence_brief, cadence_summary_lines
+from science.cadence import cadence_brief, cadence_summary_lines, maturity_calibration
+from science.gdd import lookup_crop_info
 from storage.common import STATE_FILE_LOCK
-from storage.state import find_tracked_crop, load_state
+from storage.state import crop_target_gdd, find_tracked_crop, load_state
 
 
 def _resolve_crop(state, crop_hint: str = "") -> str:
@@ -68,6 +69,11 @@ def _ensure_harvest_table():
                     note TEXT
                 )
             ''')
+            # 2026-10-29 新增：這次割收屬於哪一輪（/sow 的起算日）。舊表沒有這欄就補上；
+            # 舊記錄留空，首採積溫校準只採計有起算日的記錄（累計值才有意義）。
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(harvest_records)").fetchall()}
+            if "cycle_start_date" not in cols:
+                conn.execute("ALTER TABLE harvest_records ADD COLUMN cycle_start_date TEXT")
             conn.commit()
             conn.close()
         HARVEST_TABLE_READY = True
@@ -95,6 +101,8 @@ def record_harvest(note: str = "", crop_hint: str = "") -> str:
     state = load_state()
     crop_name = _resolve_crop(state, crop_hint)
     acc_gdd = _current_accumulated_gdd(state, crop_name)
+    crop_entry = state.get("crops", {}).get(crop_name, {})
+    cycle_start = str(crop_entry.get("cycle_start_date", "") or "") if isinstance(crop_entry, dict) else ""
 
     try:
         with STATE_FILE_LOCK:
@@ -104,6 +112,12 @@ def record_harvest(note: str = "", crop_hint: str = "") -> str:
                 "SELECT harvest_date, accumulated_gdd_snapshot FROM harvest_records "
                 "WHERE crop_name = ? ORDER BY harvest_date DESC, id DESC LIMIT 1",
                 (crop_name,)).fetchone()
+            # 本輪（同一個起算日）是否已經採收過：沒有 → 這次就是「首採」，累計 GDD 是成熟積溫樣本
+            first_in_cycle = False
+            if cycle_start:
+                first_in_cycle = conn.execute(
+                    "SELECT COUNT(*) FROM harvest_records WHERE crop_name = ? AND cycle_start_date = ?",
+                    (crop_name, cycle_start)).fetchone()[0] == 0
 
             # 同日重複登記防呆：手滑連按兩次 /harvest（或確認逾時自動落檔後
             # 又手動補登）會寫入「間隔 0 天」的再生週期，把平均週期統計往下拉。
@@ -138,28 +152,62 @@ def record_harvest(note: str = "", crop_hint: str = "") -> str:
 
             conn.execute(
                 "INSERT INTO harvest_records "
-                "(harvest_date, crop_name, is_first_of_cycle, days_since_prev, gdd_since_prev, accumulated_gdd_snapshot, note) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (today_str, crop_name, is_first, days_since, gdd_since, acc_gdd, str(note)[:100]))
+                "(harvest_date, crop_name, is_first_of_cycle, days_since_prev, gdd_since_prev, "
+                "accumulated_gdd_snapshot, note, cycle_start_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (today_str, crop_name, is_first, days_since, gdd_since, acc_gdd, str(note)[:100], cycle_start))
             conn.commit()
             conn.close()
     except Exception as e:
         logger.error(f"❌ [Harvest] 寫入割收記錄失敗: {e}")
         return f"❌ 割收記錄失敗：{e}"
 
-    logger.info(f"🌾 [Harvest] 已登記割收: {crop_name} @ {today_str}, 距上次 {days_since} 天, 期間 GDD {gdd_since}")
+    logger.info(f"🌾 [Harvest] 已登記割收: {crop_name} @ {today_str}, 距上次 {days_since} 天, 期間 GDD {gdd_since}, 本輪起算 {cycle_start or '無'}")
+
+    # 首採積溫：有 /sow 起算日、且本輪第一次採 → 這個累計值就是一筆「真實成熟積溫」
+    maturity_text = ""
+    if first_in_cycle:
+        _, info = lookup_crop_info(crop_name)
+        target = crop_target_gdd(state, crop_name, info)
+        samples = _maturity_samples(crop_name)
+        cal_text, _ = maturity_calibration(samples, target, crop_name)
+        maturity_text = (f"\n🌱 本輪自 {cycle_start} 播種起累計 {acc_gdd} ℃-day 首採（目前目標 {target}）。"
+                         + (f"\n{cal_text}" if cal_text else ""))
+    elif not cycle_start:
+        maturity_text = "\n（提示：播種／定植當天用 /sow 作物名 起算，之後的首採積溫才能用來校準目標。）"
 
     if is_first:
         return (f"🌾 已記錄 {crop_name} 的割收（{today_str}）。\n"
                 f"這是本輪種植的第一次割收，將作為週期計時的基準點——"
-                f"下次割收後我就能算出第一個再生週期了。")
+                f"下次割收後我就能算出第一個再生週期了。{maturity_text}")
     else:
         days_text = f"{days_since} 天" if days_since is not None else "未知"
         gdd_text = f"，期間累積約 {gdd_since} ℃-day" if gdd_since is not None else ""
         days_list, gdds_list = _collect_regen_intervals(crop_name)
         return (f"🌾 已記錄 {crop_name} 的割收（{today_str}）。\n"
                 f"距離上次割收 {days_text}{gdd_text}。\n"
-                f"{cadence_brief(days_list, gdds_list)}")
+                f"{cadence_brief(days_list, gdds_list)}{maturity_text}")
+
+
+def _maturity_samples(crop_name):
+    """各輪（依 cycle_start_date 分組）首次採收時的累計 GDD，由舊到新。只採計有起算日的記錄。"""
+    _ensure_harvest_table()
+    try:
+        with STATE_FILE_LOCK:
+            conn = sqlite3.connect(DB_FILE)
+            rows = conn.execute(
+                "SELECT cycle_start_date, accumulated_gdd_snapshot FROM harvest_records "
+                "WHERE crop_name = ? AND cycle_start_date IS NOT NULL AND cycle_start_date != '' "
+                "ORDER BY harvest_date, id", (crop_name,)).fetchall()
+            conn.close()
+        first_by_cycle = {}
+        for start, snap in rows:
+            if start not in first_by_cycle and snap is not None:
+                first_by_cycle[start] = float(snap)
+        return [first_by_cycle[k] for k in sorted(first_by_cycle)]
+    except Exception as e:
+        logger.warning(f"⚠️ [Harvest] 讀取首採積溫樣本失敗: {e}")
+        return []
 
 
 def _collect_regen_intervals(crop_name):
@@ -201,4 +249,16 @@ def get_harvest_cadence_summary(crop_name=None) -> str:
         return f"【割收節律】讀取失敗：{e}"
 
     days, gdds = _collect_regen_intervals(crop_name)
-    return cadence_summary_lines(crop_name, total, first, last, days, gdds)
+    text = cadence_summary_lines(crop_name, total, first, last, days, gdds)
+    # 成熟目標校準：各輪首採積溫 vs 目前目標
+    state = load_state()
+    entry = state.get("crops", {}).get(crop_name, {})
+    _, info = lookup_crop_info(crop_name)
+    target = crop_target_gdd(state, crop_name, info)
+    src = "自訂" if isinstance(entry, dict) and entry.get("target_gdd") else "資料庫粗估"
+    start = entry.get("cycle_start_date", "") if isinstance(entry, dict) else ""
+    text += f"\n- 成熟目標積溫：{target} ℃-day（{src}）；本輪起算日：{start or '未用 /sow 起算'}"
+    cal_text, _ = maturity_calibration(_maturity_samples(crop_name), target, crop_name)
+    if cal_text:
+        text += "\n- " + cal_text
+    return text

@@ -58,7 +58,10 @@ from storage.photos import get_past_photo, save_photo
 from storage.predictions import load_prediction_feedback
 from storage.pushlog import load_last_push_brief
 from storage.vision_log import load_visual_history
-from storage.state import active_crops, load_state, set_crop_tracking, update_state
+from storage.state import (
+    active_crops, crop_target_gdd, load_state, set_crop_target, set_crop_tracking,
+    start_crop_cycle, update_state,
+)
 from tg.api import (
     BTN_FERTILIZED, BTN_FULL_ANALYSIS, BTN_SNAPSHOT, FARM_KEYBOARD,
     FARM_STATUS_QUESTION, FERTILIZE_PHRASE,
@@ -84,8 +87,10 @@ async def handle_local_command(chat_id, text) -> bool:
             "/crops — 作物追蹤清單（含已停止追蹤的）\n"
             "/crop_add 萵苣 — 加入一種同時在種的作物到每日 GDD 追蹤\n"
             "/crop_done 萵苣 — 停止累積某作物（清園後用，保留積溫）\n"
+            "/sow 空心菜 — 播種／定植當天起算：該作物積溫歸零、記下起算日（首採積溫校準的前提）\n"
             "/harvest — 精確登記一次割收（亦可直接對我說「我收成空心菜了」）\n"
-            "/harvest_stats — 查看割收週期歸納\n"
+            "/harvest_stats — 查看割收週期歸納與首採積溫校準建議\n"
+            "/target 空心菜 350 — 手動設定該作物的成熟目標積溫（/target 空心菜 reset 回到預設）\n"
             "/et0 — 今日參考蒸散量與各作物需水 ETc（文山站實測推算）\n"
             "/vision — 照片視覺生長日誌（可加作物名，例：/vision 空心菜）\n"
             "/disease — 葉部病害風險評估（高濕悶熱 × 適病溫區，事前預警）\n"
@@ -171,6 +176,44 @@ async def handle_local_command(chat_id, text) -> bool:
         await send_telegram_message(chat_id, msg)
         return True
 
+    if cmd in ("/sow", "/plant"):
+        if len(parts) < 2:
+            await send_telegram_message(chat_id, "用法：/sow 作物名 [備註]（播種或定植當天用；該作物積溫從今天重新起算，上一輪數字保留在紀錄裡）")
+            return True
+        crop_arg = parts[1].strip()[:40]
+        note = " ".join(parts[2:]).strip()
+        key, old_acc, old_start = await asyncio.to_thread(start_crop_cycle, crop_arg, note)
+        prev = f"（上一輪自 {old_start or '不明'} 累計 {old_acc} ℃-day 已存檔）" if old_acc else ""
+        await send_telegram_message(chat_id, (
+            f"🌱 已為「{key}」開始新一輪：今天起算、積溫歸零、納入每日追蹤。{prev}\n"
+            f"首次採收時用 /harvest 登記，累計到的積溫就會成為你這塊地的成熟積溫樣本。"
+        ))
+        return True
+
+    if cmd == "/target":
+        if len(parts) < 3:
+            await send_telegram_message(chat_id, "用法：/target 作物名 數值（℃-day）；/target 作物名 reset 回到資料庫預設")
+            return True
+        crop_arg = parts[1].strip()[:40]
+        val = parts[2].strip().lower()
+        if val in ("reset", "default", "預設"):
+            key, eff, found = await asyncio.to_thread(set_crop_target, crop_arg, None)
+        else:
+            try:
+                num = float(val)
+            except ValueError:
+                await send_telegram_message(chat_id, "⚠️ 數值格式錯誤。用法：/target 空心菜 350")
+                return True
+            if not (50 <= num <= 5000):
+                await send_telegram_message(chat_id, "⚠️ 目標積溫要在 50~5000 ℃-day 之間（葉菜約 300~600、果菜約 800~1200）。")
+                return True
+            key, eff, found = await asyncio.to_thread(set_crop_target, crop_arg, num)
+        if not found:
+            await send_telegram_message(chat_id, f"⚠️ 找不到作物「{key}」。用 /crops 查看清單，或先 /crop_add 加入。")
+            return True
+        await send_telegram_message(chat_id, f"🎯 「{key}」的成熟目標積溫現在是 {eff} ℃-day。/gdd 與需水估算都會用這個值。")
+        return True
+
     if cmd in ("/harvest_stats", "/harveststats", "/cadence"):
         summary = await asyncio.to_thread(get_harvest_cadence_summary)
         await send_telegram_message(chat_id, summary)
@@ -215,11 +258,13 @@ async def handle_local_command(chat_id, text) -> bool:
             cd = state.get("crops", {}).get(crop, {})
             acc = cd.get("accumulated_gdd", 0.0)
             _, info = lookup_crop_info(crop)
-            target = info.get("target_gdd", 1000.0)
+            target = crop_target_gdd(state, crop, info)
             pct = round(acc / target * 100.0, 1) if target else 0.0
             star = "⭐ " if crop == focus else "　 "
+            custom = "（自訂目標）" if cd.get("target_gdd") else ""
+            since = f"｜{cd['cycle_start_date']} 起算" if cd.get("cycle_start_date") else ""
             lines.append(
-                f"{star}{crop}\n"
+                f"{star}{crop}{custom}{since}\n"
                 f"　 🎒 {acc} / {target} ℃-day（{pct}%）"
                 f"｜基溫 {info.get('t_base')}℃/上限 {info.get('t_upper', 30.0)}℃"
                 f"｜上次結算 {cd.get('last_gdd_date') or '無'}"
@@ -419,7 +464,7 @@ async def handle_message(message):
     pending = get_pending_event(chat_id)
     if pending and not text.startswith("/") and not (photo and caption.startswith("/")):
         verdict = classify_confirmation(user_input_text)
-        ev_label = "收成" if pending["type"] == "harvest" else "施肥"
+        ev_label = {"harvest": "收成", "fertilizer": "施肥", "sow": "播種起算"}.get(pending["type"], "登記")
         if verdict == "no":
             clear_pending_event(chat_id)
             await send_telegram_message(chat_id, f"👌 好的，這次的{ev_label}就不記錄了。")

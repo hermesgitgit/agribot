@@ -37,7 +37,7 @@ from storage.harvest import get_harvest_cadence_summary
 from storage.knowledge import search_knowledge
 from storage.history import load_history_summary
 from storage.predictions import load_prediction_feedback, save_prediction
-from storage.state import load_state, set_crop_tracking, update_state
+from storage.state import crop_target_gdd, load_state, set_crop_target, set_crop_tracking, update_state
 from storage.summaries import load_daily_summaries
 from storage.vision_log import load_visual_history, record_visual_assessment
 
@@ -174,7 +174,7 @@ def tool_record_visual_assessment(crop_name: str, stage: str, vigor: int, covera
     gdd_stage = None
     if cd:
         _, info = lookup_crop_info(matched)
-        target = info.get("target_gdd", 1000.0)
+        target = crop_target_gdd(state, matched, info)
         frac = (cd.get("accumulated_gdd", 0.0) / target) if target else 0.0
         gdd_stage = growth_stage(frac)
     cc = crosscheck_stage(rec["stage"], gdd_stage)
@@ -228,6 +228,35 @@ def tool_record_harvest_event(crop_hint: str = "", note: str = "") -> str:
     return "已發起收成登記的確認（若使用者於 10 分鐘內未回覆取消，系統將自動完成登記）。請在回覆中告知使用者你將為他登記這次收成，若只是隨口提及可回覆『不用』取消。"
 
 
+def tool_start_crop_cycle(crop_name: str, note: str = "") -> str:
+    """當使用者表達『他今天（或剛剛）播種／播下／定植／移植了某作物』（例如「今天播了空心菜」「番茄苗定植了」「秋葵種下去了」）時呼叫，為該作物開始新的一輪：累計積溫歸零、記下起算日、納入每日追蹤。有了起算日，之後首次採收的累計積溫才能用來校準這塊地的成熟目標。注意：本工具不會立即寫入，而是發起一則確認（積溫歸零不可逆），請在回覆中告訴使用者你將為他起算、若只是討論可回覆「不用」取消。切勿在使用者只是『考慮要種』『問什麼時候播』『提到別人種』時呼叫；「同時也種了」但沒說今天播種的，用 tool_track_crop。"""
+    if _current_chat_ctx.get() is None:
+        return "（無法登記：缺少對話內容）"
+    crop = str(crop_name or "").strip()[:40]
+    if not crop:
+        return "（作物名稱不可為空）"
+    ok = _set_pending_event(_current_chat_ctx.get(), "sow", (note or "")[:60], crop_hint=crop)
+    if not ok:
+        return "目前已有另一筆尚未確認的事件，請先請使用者回覆前一個確認，再處理這次播種起算。"
+    return f"已發起「{crop} 播種起算」的確認（10 分鐘內未取消即生效：積溫歸零、今天起算）。請在回覆中告知使用者，若只是討論可回覆『不用』取消。"
+
+
+def tool_set_target_gdd(crop_name: str, target_gdd: float) -> str:
+    """設定某作物的成熟目標積溫（℃-day）。適用時機：使用者明確要求改目標（例：「把空心菜的目標改成 350」），或 /harvest_stats、tool_query_harvest_cadence 回傳的首採積溫校準建議被使用者採納時。立即生效、可逆（再設一次或請他用 /target 作物 reset 回預設）。不要未經使用者同意就依校準建議自行呼叫。"""
+    crop = str(crop_name or "").strip()[:40]
+    try:
+        num = float(target_gdd)
+    except (TypeError, ValueError):
+        return "❌ 目標積溫必須是數字。"
+    if not (50 <= num <= 5000):
+        return "❌ 目標積溫要在 50~5000 ℃-day 之間。"
+    key, eff, found = set_crop_target(crop, num)
+    if not found:
+        return f"⚠️ 找不到作物「{key}」，未做變更。可請使用者用 /crops 查看清單。"
+    logger.info(f"🎯 [Agentic Closed-Loop / 工具呼叫] {key} 目標積溫設為 {eff}")
+    return f"✅ 「{key}」的成熟目標積溫已設為 {eff} ℃-day（/gdd 與需水估算都會採用）。請告知使用者。"
+
+
 def tool_record_fertilizer_event(note: str = "") -> str:
     """當使用者在對話中表達『他剛剛或今天施肥／追肥／施了某種肥』時呼叫此工具，登記一次施肥事件。note 為使用者描述（如『施了氮肥』『撒了有機肥』，可留空）。注意：本工具不會立即寫入，而是發起一則確認，等待使用者下一句確認後才正式記錄。請在你的回覆中告訴使用者你將為他登記這次施肥、並說明若只是隨口提及可以喊停。切勿在使用者只是『考慮』『詢問』施肥時呼叫。"""
     if _current_chat_ctx.get() is None:
@@ -269,4 +298,6 @@ AGENT_TOOLS = [
     tool_search_agri_knowledge,
     tool_record_harvest_event,
     tool_record_fertilizer_event,
+    tool_start_crop_cycle,
+    tool_set_target_gdd,
 ]

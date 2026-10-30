@@ -33,6 +33,7 @@ import time
 from logging_setup import logger
 from storage.events import save_fertilizer_event
 from storage.harvest import record_harvest
+from storage.state import start_crop_cycle
 
 PENDING_EVENTS = {}  # chat_id -> {"type": "harvest"/"fertilizer", "note": str, "created_epoch": float}
 PENDING_EVENT_TTL = 600  # 確認窗 10 分鐘：期間可喊停，逾時視為默認同意自動落檔
@@ -118,6 +119,11 @@ def _apply_pending_event(ev) -> str:
     if etype == "fertilizer":
         save_fertilizer_event(note or "使用者登記施肥")
         return f"🧪 已記錄施肥事件：{note}"
+    if etype == "sow":
+        key, old_acc, old_start = start_crop_cycle(ev.get("crop_hint", ""), note)
+        prev = f"（上一輪自 {old_start or '不明'} 累計 {old_acc} ℃-day 已存檔）" if old_acc else ""
+        return (f"🌱 已為「{key}」開始新一輪：今天起算、積溫歸零、納入每日追蹤。{prev}\n"
+                f"首次採收時登記割收，累計到的積溫就會成為這塊地的成熟積溫樣本。")
     return ""
 
 

@@ -292,7 +292,7 @@ def _crop_water_demand_block(et0_mm) -> str:
     """
     from science.gdd import lookup_crop_info
     from science.water import crop_water_demand
-    from storage.state import active_crops, load_state
+    from storage.state import active_crops, crop_target_gdd, load_state
 
     state = load_state()
     crops = active_crops(state)
@@ -302,7 +302,7 @@ def _crop_water_demand_block(et0_mm) -> str:
     for crop in crops:
         cd = state.get("crops", {}).get(crop, {})
         _, info = lookup_crop_info(crop)
-        target = info.get("target_gdd", 1000.0)
+        target = crop_target_gdd(state, crop, info)
         r = crop_water_demand(crop, cd.get("accumulated_gdd", 0.0), target, et0_mm)
         etc_text = f"ETc ≈ {r['etc']} mm/日" if r["etc"] is not None else "ETc 無法計算"
         lines.append(f"  · {crop}：{r['stage']}、Kc≈{r['kc']} → {etc_text}")

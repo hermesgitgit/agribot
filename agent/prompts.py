@@ -252,7 +252,7 @@ def build_state_summary() -> str:
     """組裝目前農園監控狀態摘要（供 prompt 注入與工具查詢共用）。"""
     from science.gdd import lookup_crop_info
     from science.water import growth_stage
-    from storage.state import active_crops
+    from storage.state import active_crops, crop_target_gdd
 
     current_state = load_state()
     active_crop = current_state.get("crop_name", "番茄 (Tomato)")
@@ -263,13 +263,15 @@ def build_state_summary() -> str:
     for crop in tracked:
         cd = current_state.get("crops", {}).get(crop, {})
         _, info = lookup_crop_info(crop)
-        target = info.get("target_gdd", 1000.0)
+        target = crop_target_gdd(current_state, crop, info)
         acc = cd.get("accumulated_gdd", 0.0)
         frac = (acc / target) if target else 0.0
         stage = growth_stage(frac)
         focus = "（焦點）" if crop == active_crop else ""
+        tsrc = "自訂目標" if cd.get("target_gdd") else "資料庫粗估目標"
+        since = f"，{cd['cycle_start_date']} 播種起算" if cd.get("cycle_start_date") else "，未用 /sow 起算"
         crop_lines.append(
-            f"  · {crop}{focus}：累計 {acc} / {target} ℃-day（{round(frac * 100)}%，{stage}）"
+            f"  · {crop}{focus}：累計 {acc} / {target} ℃-day（{round(frac * 100)}%，{stage}；{tsrc}{since}）"
             f"（基溫 {info['t_base']}℃ / 上限 {info.get('t_upper', 30.0)}℃，上次結算 {cd.get('last_gdd_date') or '無'}）"
         )
     crops_block = "\n".join(crop_lines) if crop_lines else "  · （尚未設定作物）"
@@ -346,6 +348,7 @@ SYSTEM_INSTRUCTION = """
       · `tool_finish_crop`：某作物「整畦拔光、清園、不再種」（例：「空心菜拔光了」）。停止其每日累積、保留歷史積溫。注意這跟「割收一次但繼續種」（那是 tool_record_harvest_event）不同。
       內建作物：水稻、玉米、番茄、萵苣、草莓、馬鈴薯、高麗菜、小黃瓜、空心菜；其他名稱以預設參數註冊。track/finish 兩個工具「立即生效、無需確認」（加入/停止追蹤低風險可逆）；若使用者一句話提到多種作物（如「我種了空心菜跟秋葵」），就分別呼叫 tool_track_crop 多次、一次到位。呼叫後在回覆告知使用者，並提醒誤會時可請他說「停止追蹤某作物」。切勿在使用者只是詢問/考慮/提到別人時呼叫。
     - 請隨時結合各在種作物的 GDD 進度與未來氣候，分析它們是否已接近各自的成熟目標積溫，並適時給予關懷與採收建議。
+    - 成熟目標積溫只是粗估：各作物的 target_gdd 來自資料庫概略值，真正可靠的是這塊地自己的實收。流程是：播種／定植當天起算（/sow 或 `tool_start_crop_cycle`）→ 首次採收登記 → 系統把「首採時的累計積溫」存成樣本，累積兩輪以上就在 /harvest_stats 與 `tool_query_harvest_cadence` 給出校準建議。建議只是建議：使用者同意後才用 `tool_set_target_gdd` 改目標，絕不自行套用。狀態摘要會標明每個作物的目標是「自訂」還是「資料庫粗估」、以及有沒有起算日；沒起算日的作物，累計值不能當成熟積溫解讀。
     - 對可連續割收的作物（如空心菜），使用者會以 /harvest 指令登記每次割收。你可呼叫 `tool_query_harvest_cadence` 查詢已歸納的採收節律（日曆週期、積溫週期、推估下次可割日），據此提供「預計再過幾天可割收」這類前瞻建議；但務必尊重資料中標註的樣本數與信心水準，樣本不足時說明這只是初步觀察。
 11. **工具自主使用原則 (Agentic Tool Use)**：
     - 你配備了可自主呼叫的工具：即時感測抓取、天氣預報、近期歷史、長期日彙總、農園狀態查詢、門檻/作物設定、預測登記與預測履歷查詢、割收節律查詢、ET₀ 蒸散量推算、葉部病害風險評估（tool_assess_disease_risk）、農業知識庫檢索（tool_search_agri_knowledge，內含百餘本農業部官方栽培與病蟲害技術手冊全文）。
@@ -366,6 +369,7 @@ SYSTEM_INSTRUCTION = """
 14. **收成與施肥事件登記 (Event Logging)**：
     - 當使用者在對話中表達『他剛剛或今天**收成／採收／割收**了作物』（例如「我收成空心菜了」「今天割了一批菜」，或上傳收成的照片並提及採收），請呼叫 `tool_record_harvest_event` 登記。
     - 當使用者表達『他剛剛或今天**施肥／追肥**了』（例如「我施肥了」「剛追了肥」），請呼叫 `tool_record_fertilizer_event` 登記。
+    - 當使用者表達『他今天**播種／定植／移植**了某作物』（例如「今天播了空心菜」「番茄苗定植了」），請呼叫 `tool_start_crop_cycle` 起算新一輪（同樣是待確認制；積溫歸零不可逆，所以要讓他有喊停機會）。
     - 這兩個工具不會立即寫入，而是發起一則待確認。呼叫後，請在你的回覆中**明確告訴使用者你將為他登記這次收成／施肥**，並補一句「若只是隨口提及、不需記錄，回覆『不用』即可」，讓他有喊停的機會。收成登記會更新採收週期統計，可順帶提及。
     - **務必謹慎**：只有在使用者表達『他自己、已經、實際』做了這件事時才呼叫。若他只是在『詢問要不要收成／施肥』『考慮中』『提到別人收成』『討論一般作法』，**絕對不要**呼叫這些工具，正常回答即可。判斷不確定時，寧可不登記、改用一句話向他確認。
 15. **格式規範**：

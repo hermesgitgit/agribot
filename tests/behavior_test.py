@@ -432,6 +432,79 @@ def print_model_checklist():
         print(f"      ✗ 包：{bad}")
 
 
+def test_harvest_calibration():
+    section("播種起算 /sow、自訂目標 /target、首採積溫校準")
+    import datetime
+    import sqlite3
+    import tempfile
+    import storage.state as S
+    import storage.harvest as H
+    from science.cadence import maturity_calibration, median
+    from config import TZ_TAIPEI
+
+    # 純邏輯
+    check("median 奇數/偶數", median([3, 1, 2]) == 2 and median([1, 4]) == 2.5)
+    t, sug = maturity_calibration([], 300)
+    check("無樣本→不建議", t == "" and sug is None)
+    t, sug = maturity_calibration([300.0], 350)
+    check("單一樣本→只提示再多一輪", "再多一輪" in t and sug is None, t)
+    t, sug = maturity_calibration([320.0, 340.0, 330.0], 280, "空心菜 (Water Spinach)")
+    check("三輪中位數 330、差 18%→建議 /target 空心菜 330", sug == 330 and "/target 空心菜 330" in t, t)
+    t, sug = maturity_calibration([300.0, 310.0], 305)
+    check("差在 10% 內→相符不建議", "相符" in t and sug is None, t)
+
+    tmp = tempfile.mkdtemp()
+    old_state, old_db, old_ready = S.STATE_FILE, H.DB_FILE, H.HARVEST_TABLE_READY
+    S.STATE_FILE = os.path.join(tmp, "state.json")
+    H.DB_FILE = os.path.join(tmp, "agri.db")
+    H.HARVEST_TABLE_READY = False
+    try:
+        crop = "空心菜 (Water Spinach)"
+        S.update_state(lambda st: st["crops"].update({crop: {"accumulated_gdd": 450.0, "last_gdd_date": "2026-10-01", "active": True}}))
+        key, old_acc, old_start = S.start_crop_cycle("空心菜", "第二畦")
+        st = S.load_state()
+        e = st["crops"][key]
+        today = datetime.datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d")
+        check("start_crop_cycle 對到既有鍵、歸零、記起算日", key == crop and e["accumulated_gdd"] == 0.0 and e["cycle_start_date"] == today, str(e))
+        check("上一輪累計存進 prev_cycle", old_acc == 450.0 and e["prev_cycle"]["accumulated_gdd"] == 450.0)
+        yday = (datetime.datetime.now(TZ_TAIPEI) - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        check("last_gdd_date 設為昨天（今晚只結算今天）", e["last_gdd_date"] == yday and e["active"] is True)
+
+        check("crop_target_gdd 預設取資料庫 300", S.crop_target_gdd(st, crop) == 300.0)
+        k2, eff, found = S.set_crop_target("空心菜", 350)
+        check("set_crop_target 自訂 350", found and eff == 350.0 and k2 == crop)
+        check("crop_target_gdd 讀到自訂", S.crop_target_gdd(S.load_state(), crop) == 350.0)
+        k3, eff3, found3 = S.set_crop_target("空心菜", None)
+        check("reset 回到 300", found3 and eff3 == 300.0)
+        _, _, found4 = S.set_crop_target("火龍果", 500)
+        check("不存在的作物→found False", found4 is False)
+
+        # 先塞一輪舊紀錄（8 月那輪首採 320），再模擬本輪累計到 280 首採
+        H._ensure_harvest_table()
+        c = sqlite3.connect(H.DB_FILE)
+        c.execute("INSERT INTO harvest_records (harvest_date, crop_name, is_first_of_cycle, accumulated_gdd_snapshot, note, cycle_start_date) VALUES (?,?,?,?,?,?)",
+                  ("2026-08-25", crop, 1, 320.0, "", "2026-08-01"))
+        c.commit(); c.close()
+        S.update_state(lambda st: st["crops"][crop].update({"accumulated_gdd": 280.0}))
+        msg = H.record_harvest("", crop_hint="空心菜")
+        check("首採訊息含本輪起算與累計 280", f"自 {today} 播種起累計 280.0" in msg, msg)
+        check("兩輪樣本→中位數 300 與目標相符", "2 輪" in msg and "相符" in msg, msg)
+        check("舊的 >45 天空窗視為新一輪基準點", "第一次割收" in msg, msg)
+        dup = H.record_harvest("", crop_hint="空心菜")
+        check("同日重複登記被擋", "不重複登記" in dup, dup)
+        summ = H.get_harvest_cadence_summary(crop)
+        check("harvest_stats 含目標來源與起算日", "成熟目標積溫：300.0" in summ and today in summ, summ)
+        check("harvest_stats 含校準行", "首採積溫中位數約 300" in summ, summ)
+
+        # 沒用 /sow 的作物：割收只給提示，不算樣本
+        S.update_state(lambda st: st["crops"].update({"秋葵 (Okra)": {"accumulated_gdd": 900.0, "last_gdd_date": "", "active": True}}))
+        msg2 = H.record_harvest("", crop_hint="秋葵")
+        check("無起算日→提示用 /sow、不出校準", "提示：播種" in msg2 and "本輪自" not in msg2, msg2)
+        check("無起算日的紀錄不進樣本", H._maturity_samples("秋葵 (Okra)") == [])
+    finally:
+        S.STATE_FILE, H.DB_FILE, H.HARVEST_TABLE_READY = old_state, old_db, old_ready
+
+
 def main():
     print("===== agribot 行為回歸測試 =====")
     test_classify_confirmation()
@@ -448,6 +521,7 @@ def main():
     test_kb_context()
     test_cwa_alerts()
     test_report_resilience()
+    test_harvest_calibration()
     print_model_checklist()
     print(f"\n===== 結果：{_PASS} 通過 / {_FAIL} 失敗 =====")
     sys.exit(1 if _FAIL else 0)

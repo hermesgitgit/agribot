@@ -130,7 +130,7 @@ def _pending_days_for(last_gdd_date_str, yesterday):
     return days, skipped
 
 
-def _settle_crop(crop_name, pending_days, skipped_old, yesterday_str, minmax_cache):
+def _settle_crop(crop_name, pending_days, skipped_old, yesterday_str, minmax_cache, target_override=None):
     """
     計算單一作物在其待結算區間的新增 GDD（純計算，不寫 state）。
     minmax_cache 跨作物共用每日溫度，避免同一天被多個作物重複查 DB。
@@ -143,6 +143,11 @@ def _settle_crop(crop_name, pending_days, skipped_old, yesterday_str, minmax_cac
     uses_default = (matched_key == DEFAULT_CROP_KEY)  # 借用預設參數（DB 查無此作物）
     t_base, t_upper = info["t_base"], info.get("t_upper", 30.0)
     target_gdd = info.get("target_gdd", 1000.0)
+    try:  # 使用者自訂（/target 或實收校準）的目標優先
+        if target_override is not None and float(target_override) > 0:
+            target_gdd = float(target_override)
+    except (TypeError, ValueError):
+        pass
     added, lines, missing = 0.0, [], 0
     for d_str in pending_days:
         if d_str not in minmax_cache:
@@ -208,7 +213,9 @@ async def check_and_update_gdd() -> str:
     computed = {}  # crop -> settle dict
     for crop, (days, skipped) in plans.items():
         if days or skipped:
-            computed[crop] = _settle_crop(crop, days, skipped, yesterday_str, minmax_cache)
+            cd = state.get("crops", {}).get(crop, {})
+            computed[crop] = _settle_crop(crop, days, skipped, yesterday_str, minmax_cache,
+                                          target_override=cd.get("target_gdd") if isinstance(cd, dict) else None)
 
     # 交易性更新：一次持鎖把所有有結算的作物寫回（原子、避免與其他更新路徑互相覆蓋）
     settle_crops = {c: r for c, r in computed.items() if plans[c][0]}  # 真有待結算日的才寫
