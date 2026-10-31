@@ -11,11 +11,15 @@ import json
 import urllib.request
 import urllib.error
 
+import os
+
 from config import NVIDIA_API_KEY, redact
 from logging_setup import logger
 
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL = "openai/gpt-oss-120b"  # 非中國的強推理模型；報告品質導向
+# 原本 gpt-oss-120b 於 2026-09-03 下架（HTTP 410），改同家族 gpt-oss-20b（回傳格式相同）；
+# 可用環境變數 NVIDIA_MODEL 換模型，不必改碼。
+MODEL = os.getenv("NVIDIA_MODEL", "").strip() or "openai/gpt-oss-20b"
 
 
 def is_configured() -> bool:

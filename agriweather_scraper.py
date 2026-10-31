@@ -140,7 +140,7 @@ from agent.pending import (
 )
 from agent.guard import (
     MAX_THRESHOLD_STEP, URL_PATTERN,
-    apply_crop_command, apply_threshold_command, strip_links,
+    strip_legacy_markers, strip_links,
 )
 from agent.prompts import SYSTEM_INSTRUCTION, build_state_summary, get_current_time_context
 from agent.tools import (

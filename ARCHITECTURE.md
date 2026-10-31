@@ -20,7 +20,7 @@ flowchart TD
     H --> SCR
 
     subgraph GUARD[AI 輸出防護]
-        CG[Command Guard<br/>驗證 AI 控制指令<br/>數值範圍 · Link Guard]
+        CG[工具層閘門<br/>寫入工具數值範圍＋當日累計上限<br/>無人監看輪次只給唯讀工具 · Link Guard]
         PEND[待確認事件<br/>收成/施肥確認才落檔]
     end
 
@@ -46,8 +46,12 @@ flowchart TD
 
 ## 設計重點
 
-- **AI 不直接寫狀態**：Gemini 吐出的閉環控制指令（調門檻、切作物）一律經 `agent/guard.py` 的
-  Command Guard 驗證——數值範圍檢查（`0 < dry < wet < 100`、單次調幅上限）、AI 回覆中的連結一律移除。
+- **AI 只能經工具呼叫改狀態**：調門檻、切作物只有 `agent/tools.py` 的工具一條路，工具內有數值範圍
+  （`0 < dry < wet < 60`）、單次與當日累計調幅上限。舊版「回覆裡夾 `[SET_THRESHOLD]` 文字標記」的解析器
+  已於 2026-10-31 拆掉：出現只清除並記 warning，絕不套用。
+- **無人監看的輪次只有唯讀工具**：定時推播、哨兵、Hermes 橋接 `/ask` 都用 `READONLY_TOOLS`（查詢類），
+  prompt 裡夾著爬來的外部資料也改不了任何狀態；橋接另用獨立 session，不共用主人的對話記憶。
+  AI 回覆中的連結一律移除（`agent/guard.py`）。
 - **破壞性事件要確認**：收成/施肥會寫進長期記錄，先登記為「待確認」，使用者確認或喊停視窗逾時才落檔
   （`agent/pending.py`，threading.Lock 認領 + contextvars 隔離併發）。
 - **橋接最小開放**：`bridge/server.py` 只監聽內部 Docker 網路、要求 HMAC 共用密鑰、body 上限、

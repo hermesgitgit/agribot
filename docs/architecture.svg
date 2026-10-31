@@ -1,6 +1,6 @@
 <svg width="100%" viewBox="0 0 760 660" role="img" xmlns="http://www.w3.org/2000/svg">
 <title>agribot 架構圖</title>
-<desc>自主農務監控 Telegram bot 的分層架構：使用者經 Telegram Bot API 連到 agriweather_scraper.py 主程式，主程式並行啟動四條迴圈——Telegram 介面(tg/)、排程農務報告(services/push)、安全哨兵(services/sentinel)、看門狗(watchdog)。它們呼叫 agent/ agentic 核心：session（Gemini ReAct 多工具迴圈、重試與報告備援）、tools（感測/天氣/歷史/施肥收成登記/知識庫等工具）、pending（收成施肥待確認加鎖）、guard（閉環控制指令防護），並用 science/ 做領域計算（GDD/ET₀/病害風險）。依賴的服務與資料：Google Gemini（agentic 大腦）、NVIDIA（報告備援 gpt-oss-120b）、阿龜物聯網 IoT 與中央氣象署 CWA（經 Playwright 爬蟲抓取）、storage/ 的 SQLite 資料與 knowledge.db 知識庫 RAG（由農業部出版品離線 OCR 建立）。</desc>
+<desc>自主農務監控 Telegram bot 的分層架構：使用者經 Telegram Bot API 連到 agriweather_scraper.py 主程式，主程式並行啟動四條迴圈——Telegram 介面(tg/)、排程農務報告(services/push)、安全哨兵(services/sentinel)、看門狗(watchdog)。它們呼叫 agent/ agentic 核心：session（Gemini ReAct 多工具迴圈、重試與報告備援）、tools（感測/天氣/歷史/施肥收成登記/知識庫等工具）、pending（收成施肥待確認加鎖）、guard（閉環控制指令防護），並用 science/ 做領域計算（GDD/ET₀/病害風險）。依賴的服務與資料：Google Gemini（agentic 大腦）、NVIDIA（報告備援 gpt-oss-20b）、阿龜物聯網 IoT 與中央氣象署 CWA（經 Playwright 爬蟲抓取）、storage/ 的 SQLite 資料與 knowledge.db 知識庫 RAG（由農業部出版品離線 OCR 建立）。</desc>
 <style>
 text{font-family:'Helvetica Neue',Arial,'PingFang TC','Microsoft JhengHei','Noto Sans CJK TC',sans-serif;fill:#1a1a1a}
 .t{font-size:14px}.ts{font-size:11px;fill:#5f6368}.th{font-size:13.5px;font-weight:500}
@@ -47,7 +47,7 @@ text{font-family:'Helvetica Neue',Arial,'PingFang TC','Microsoft JhengHei','Noto
 <rect class="box" x="24" y="378" width="712" height="156" rx="10"/>
 <text class="ts" x="38" y="396">agent 依賴的外部服務與資料</text>
 <g class="c-amber"><rect x="38" y="404" width="162" height="50" rx="8"/><text class="th" x="119" y="424" text-anchor="middle">Google Gemini</text><text class="ts" x="119" y="442" text-anchor="middle">agentic 大腦</text></g>
-<g class="c-amber"><rect x="210" y="404" width="162" height="50" rx="8"/><text class="th" x="291" y="424" text-anchor="middle">NVIDIA</text><text class="ts" x="291" y="442" text-anchor="middle">報告備援 gpt-oss-120b</text></g>
+<g class="c-amber"><rect x="210" y="404" width="162" height="50" rx="8"/><text class="th" x="291" y="424" text-anchor="middle">NVIDIA</text><text class="ts" x="291" y="442" text-anchor="middle">報告備援 gpt-oss-20b</text></g>
 <g class="c-amber"><rect x="382" y="404" width="164" height="50" rx="8"/><text class="th" x="464" y="424" text-anchor="middle">阿龜物聯網 IoT</text><text class="ts" x="464" y="442" text-anchor="middle">土壤·EC·溫濕</text></g>
 <g class="c-amber"><rect x="556" y="404" width="168" height="50" rx="8"/><text class="th" x="640" y="424" text-anchor="middle">中央氣象署 CWA</text><text class="ts" x="640" y="442" text-anchor="middle">天氣預報</text></g>
 <g class="c-gray"><rect x="38" y="462" width="340" height="50" rx="8"/><text class="th" x="208" y="482" text-anchor="middle">storage/ · SQLite</text><text class="ts" x="208" y="500" text-anchor="middle">感測·事件·收成·預測·狀態</text></g>

@@ -24,7 +24,7 @@ import json
 import re
 import time
 
-from agent.guard import apply_crop_command, apply_threshold_command, strip_links
+from agent.guard import strip_legacy_markers, strip_links
 from agent.prompts import (
     current_disease_risk, disease_control_excerpts, get_current_time_context,
     has_severe_weather, parse_sensor_block,
@@ -240,9 +240,8 @@ async def hourly_safety_check_loop():
                     except Exception as retry_err:
                         logger.warning(f"⚠️ [Sentinel] 強制重產警報失敗: {retry_err}")
                 
-                # 閉環控制指令：統一經過 Command Guard 驗證後套用
-                ai_message = apply_threshold_command(ai_message, source_tag="哨兵")
-                ai_message = apply_crop_command(ai_message, source_tag="哨兵")
+                # 文字面清洗：舊版控制標記只清不套用、移除連結（本輪只帶唯讀工具，狀態不可能被改）
+                ai_message = strip_legacy_markers(ai_message, source_tag="哨兵")
                 ai_message = strip_links(ai_message, source_tag="哨兵")
 
                 await send_telegram_message(chat_id, ai_message)
@@ -255,7 +254,7 @@ async def hourly_safety_check_loop():
             fb_prompt = locals().get('prompt')
             fb_chat = locals().get('chat_id')
             if is_transient_api_error(e) and fb_prompt and fb_chat:
-                logger.warning("⚠️ [Sentinel] Gemini 壅塞耗盡，改用備援模型(gpt-oss-120b)補發緊急警報…")
+                logger.warning("⚠️ [Sentinel] Gemini 壅塞耗盡，改用 NVIDIA 備援模型補發緊急警報…")
                 fb_text = await asyncio.to_thread(generate_report_text, fb_prompt)
                 if fb_text:
                     # 降級模式：只清連結，不套用任何閉環控制指令。

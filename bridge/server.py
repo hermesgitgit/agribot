@@ -22,9 +22,11 @@
 # 模式攔截）。只監聽內部 Docker 網路、且要求共用密鑰；未設定密鑰則整條停用。
 #
 # 兩條路徑：
-#   POST /ask   {"text": "..."}      走完整 AI 對話（handle_message），會產生
-#                                     Gemini API 呼叫與花費，僅用於真正需要
-#                                     推理的問題。
+#   POST /ask   {"text": "..."}      走 AI 對話（handle_message 的唯讀模式：獨立
+#                                     session、只帶查詢工具、不共用主人的對話記憶），
+#                                     會產生 Gemini API 呼叫與花費，僅用於真正需要
+#                                     推理的問題。任何設定／登記都做不到——那些只能由
+#                                     主人在 Telegram 親自操作（2026-10-31 起）。
 #   POST /local {"command": "/status"} 走本地指令（handle_local_command），
 #                                     零 AI 額度、秒回，供簡單狀態查詢使用。
 #
@@ -47,7 +49,7 @@ _main_loop = None  # 由 bridge_server_loop() 於啟動時取得，供跨執行�
 
 # 唯讀本地指令白名單（伺服器端強制）。橋接的 /local 只准「讀」：任何會寫入
 # 農園狀態/長期記錄的指令（/threshold、/crop*、/harvest、/reset…）一律拒絕——
-# 寫入必須走 /ask 交給本系統的 AI 判斷（經 Command Guard 與待確認機制）。
+# /ask 同樣是唯讀（唯讀工具組）：橋接這條線完全沒有寫入能力。
 # Hermes 端 farm.py 也有同一份白名單，但那只是客戶端禮貌；Hermes 容器上跑的是
 # 會執行任意指令的 agent，防線必須設在本端才算數。
 READONLY_LOCAL_COMMANDS = frozenset({
@@ -88,7 +90,7 @@ async def _ask(text: str) -> str:
         token = start_capture()
         try:
             message = {"chat": {"id": int(TELEGRAM_CHAT_ID)}, "text": text}
-            await handle_message(message)
+            await handle_message(message, readonly=True)
         finally:
             reply = stop_capture(token)
         return reply

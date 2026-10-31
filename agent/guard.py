@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # ======================================================================
-# Command Guard 防護欄：AI 閉環指令的集中解析、驗證與套用
+# Command Guard 防護欄：AI 回覆的文字面清洗（舊版控制標記只清不套用、連結移除）
 # ======================================================================
 # Gemini 的輸入包含爬取的網頁文字（阿龜建議、CWA 預報），存在間接注入誘導
 # 模型輸出控制指令的理論路徑；模型本身也可能幻覺出離譜數值。
@@ -23,91 +23,29 @@
 # AI 回覆中的連結一律攔截移除（Link Guard，縱深防禦）。
 import re
 
-from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, WET_THRESHOLD_MAX
 from logging_setup import logger
-from science.gdd import CROP_GDD_DATABASE
-from storage.state import update_state
 
 
 MAX_THRESHOLD_STEP = 15.0  # AI 單次調整警戒門檻的最大允許幅度 (百分點)
 
 
-def apply_threshold_command(ai_message: str, source_tag: str = "AI") -> str:
+_LEGACY_MARKER = re.compile(r'\[SET_(?:THRESHOLD|CROP):[^\]]*\]')
+
+
+def strip_legacy_markers(ai_message: str, source_tag: str = "AI") -> str:
     """
-    從 Gemini 回覆中攔截 [SET_THRESHOLD: ...] 指令，通過安全驗證才套用至 state.json，
-    並回傳已清除隱藏標記的訊息文字。驗證規則：
-      1. 必須滿足 0 < dry < wet < WET_THRESHOLD_MAX（體積含水率的物理上限約 40~50%，
-         門檻設到 100 等於永久失效；設 dry > wet 則永久觸發）。
-      2. 單次調幅不得超過 ±MAX_THRESHOLD_STEP 個百分點（防範注入/幻覺一步到位地癱瘓監控；
-         確需大幅調整時請使用 /threshold 手動指令）。
-    不合規的指令一律丟棄並記錄 log，僅清除標記、不改寫任何狀態。
+    清掉 AI 回覆裡殘留的舊版文字標記 [SET_THRESHOLD: …]／[SET_CROP: …]，**一律不套用**。
+    歷史：早期是教模型在回覆裡夾這種標記、再由這裡解析套用到 state.json；改成 Function
+    Calling（tool_set_thresholds／tool_set_crop）之後系統指令已不再教它，但解析器留著就是
+    一條只靠「模型不要複述」撐著的旁路——爬到的網頁或知識庫段落夾帶這串字，模型依安全鐵則
+    「引述可疑內容提醒使用者」，門檻或作物就真的被改了。2026-10-31 拆掉：出現就記 warning
+    （這是注入的訊號）、從訊息裡移除，狀態一概不動。要改門檻／作物只有工具呼叫一條路，
+    而那條路有 tools.py 的數值範圍與當日累計上限把關。
     """
-    threshold_match = re.search(r'\[SET_THRESHOLD:\s*dry=([0-9\.]+),\s*wet=([0-9\.]+),\s*state=(\w+)[^\]]*\]', ai_message)
-    if not threshold_match:
-        return ai_message
-    cleaned = re.sub(r'\[SET_THRESHOLD:[^\]]*\]', '', ai_message).strip()
-    try:
-        new_dry = float(threshold_match.group(1))
-        new_wet = float(threshold_match.group(2))
-        new_state = threshold_match.group(3)
-
-        if not (0.0 < new_dry < new_wet < WET_THRESHOLD_MAX):
-            logger.warning(f"🛡️ [Command Guard] 拒絕 SET_THRESHOLD：數值不滿足 0 < dry({new_dry}) < wet({new_wet}) < {WET_THRESHOLD_MAX}（體積含水率上限）。")
-            return cleaned
-
-        def _apply(state):
-            cur_dry = float(state.get("dry_threshold", DEFAULT_DRY_THRESHOLD))
-            cur_wet = float(state.get("wet_threshold", DEFAULT_WET_THRESHOLD))
-            if abs(new_dry - cur_dry) > MAX_THRESHOLD_STEP or abs(new_wet - cur_wet) > MAX_THRESHOLD_STEP:
-                logger.warning(f"🛡️ [Command Guard] 拒絕 SET_THRESHOLD：單次調幅超過 ±{MAX_THRESHOLD_STEP} 百分點 (dry {cur_dry}->{new_dry}, wet {cur_wet}->{new_wet})。")
-                return False
-            state["lifecycle"] = f"{new_state} (AI 自主評估生長階段)"
-            state["dry_threshold"] = new_dry
-            state["wet_threshold"] = new_wet
-            return True
-
-        if update_state(_apply):
-            logger.info(f"🔄 [Agentic Closed-Loop / {source_tag}] 閾值已更新: dry={new_dry}%, wet={new_wet}%, state={new_state}")
-    except Exception as set_err:
-        logger.warning(f"⚠️ [{source_tag}] 解析 SET_THRESHOLD 指令失敗: {set_err}")
-    return cleaned
-
-
-def apply_crop_command(ai_message: str, source_tag: str = "AI") -> str:
-    """
-    從 Gemini 回覆中攔截 [SET_CROP: name=...] 指令，模糊比對資料庫後套用，
-    並回傳已清除隱藏標記的訊息文字。名稱截斷至 40 字元以內，防範超長字串注入。
-    """
-    crop_match = re.search(r'\[SET_CROP:\s*name=([^\]]+)\]', ai_message)
-    if not crop_match:
-        return ai_message
-    cleaned = re.sub(r'\[SET_CROP:[^\]]*\]', '', ai_message).strip()
-    try:
-        new_crop = crop_match.group(1).strip()[:40]
-        if not new_crop:
-            return cleaned
-        matched_crop = None
-        for k in CROP_GDD_DATABASE.keys():
-            if new_crop.split()[0] in k or k.split()[0] in new_crop:
-                matched_crop = k
-                break
-        if not matched_crop:
-            matched_crop = new_crop
-
-        def _apply(state):
-            state["crop_name"] = matched_crop
-            if matched_crop not in state.setdefault("crops", {}):
-                state["crops"][matched_crop] = {
-                    "accumulated_gdd": 0.0,
-                    "last_gdd_date": ""
-                }
-            return state["crops"][matched_crop]["accumulated_gdd"]
-
-        acc_gdd = update_state(_apply)
-        logger.info(f"🔄 [Agentic Closed-Loop / {source_tag}] 作物已切換為: {matched_crop}，目前該作物 GDD: {acc_gdd}")
-    except Exception as set_err:
-        logger.warning(f"⚠️ [{source_tag}] 解析 SET_CROP 指令失敗: {set_err}")
-    return cleaned
+    def _repl(m):
+        logger.warning(f"🛡️ [Command Guard / {source_tag}] 回覆中出現舊版控制標記，已移除且未套用（疑似注入）: {m.group(0)[:80]}")
+        return ""
+    return _LEGACY_MARKER.sub(_repl, ai_message).strip()
 
 
 URL_PATTERN = re.compile(r'(?:https?://|www\.)[^\s\)\]」』>]+', re.IGNORECASE)

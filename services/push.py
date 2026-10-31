@@ -24,7 +24,7 @@ import asyncio
 import functools
 from datetime import timedelta
 
-from agent.guard import apply_crop_command, apply_threshold_command, strip_links
+from agent.guard import strip_legacy_markers, strip_links
 from agent.prompts import (
     build_disease_report, build_state_summary, get_current_time_context,
     has_severe_weather, parse_sensor_block,
@@ -168,9 +168,8 @@ async def trigger_scheduled_push():
             except Exception as retry_err:
                 logger.warning(f"⚠️ [Scheduled] 強制重產分析失敗: {retry_err}")
         
-        # 閉環控制指令：統一經過 Command Guard 驗證後套用
-        ai_message = apply_threshold_command(ai_message, source_tag="定時推播")
-        ai_message = apply_crop_command(ai_message, source_tag="定時推播")
+        # 文字面清洗：舊版控制標記只清不套用、移除連結（本輪只帶唯讀工具，狀態不可能被改）
+        ai_message = strip_legacy_markers(ai_message, source_tag="定時推播")
         ai_message = strip_links(ai_message, source_tag="定時推播")
 
         logger.info("🤖 [Scheduled] Gemini 定時分析完成，正在推送至 Telegram...")
@@ -195,7 +194,7 @@ async def trigger_scheduled_push():
         fb_prompt = locals().get('prompt')
         fb_text = ''
         if fb_prompt:
-            logger.warning("⚠️ [Scheduled] 主報告未送出，改用備援模型(gpt-oss-120b)產報告…")
+            logger.warning("⚠️ [Scheduled] 主報告未送出，改用 NVIDIA 備援模型產報告…")
             fb_text = await asyncio.to_thread(generate_report_text, fb_prompt)
         if fb_text:
             # 備援為降級模式：只清掉連結，不套用任何閉環控制指令（不讓較弱模型改門檻/作物）。

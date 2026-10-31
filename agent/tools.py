@@ -301,3 +301,22 @@ AGENT_TOOLS = [
     tool_start_crop_cycle,
     tool_set_target_gdd,
 ]
+
+# 唯讀工具：只查詢、不改任何狀態、不發起任何登記。給「沒有主人在看輸出」的輪次用：
+# 定時推播、哨兵、以及 Hermes 經橋接 /ask 轉來的問題。這些輪次的 prompt 裡都夾著爬來的
+# 外部資料（或別的 agent 轉述的文字），被注入時模型手上若有寫入工具，門檻、作物、目標積溫
+# 就可能被改掉而沒人察覺。拿掉工具是從根本上排除，比在 prompt 裡勸「不要呼叫」可靠。
+READONLY_TOOLS = [
+    tool_get_realtime_sensor_data,
+    tool_get_weather_forecast,
+    tool_get_weather_alerts,
+    tool_query_recent_history,
+    tool_query_daily_summaries,
+    tool_get_garden_status,
+    tool_query_visual_history,
+    tool_query_prediction_history,
+    tool_query_harvest_cadence,
+    tool_get_et0_evapotranspiration,
+    tool_assess_disease_risk,
+    tool_search_agri_knowledge,
+]

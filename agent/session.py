@@ -37,7 +37,7 @@ from google import genai
 from google.genai import errors, types
 
 from agent.prompts import SYSTEM_INSTRUCTION
-from agent.tools import AGENT_TOOLS
+from agent.tools import AGENT_TOOLS, READONLY_TOOLS
 from config import GEMINI_API_KEY, now_taipei
 from logging_setup import logger
 
@@ -54,6 +54,13 @@ _client = genai.Client(api_key=GEMINI_API_KEY)
 _AGENT_CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM_INSTRUCTION,
     tools=AGENT_TOOLS,
+    automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=AFC_MAX_CALLS),
+)
+
+# 唯讀工具組：給無人監看的輪次（定時推播、哨兵、橋接 /ask）。見 agent/tools.py READONLY_TOOLS。
+_READONLY_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_INSTRUCTION,
+    tools=READONLY_TOOLS,
     automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=AFC_MAX_CALLS),
 )
 
@@ -97,13 +104,14 @@ def build_agent_model():
     return _AGENT_CONFIG
 
 
-def start_new_gemini_chat():
+def start_new_gemini_chat(readonly=False):
     """
     建立新的 agentic 對話 session。傳入 Python 函式為 tools 時，SDK 自動執行
     「模型請求工具 → 本地執行 → 結果回填 → 模型繼續推理」的 ReAct 迴路，
     直到模型產出最終文字回覆為止（與舊版 enable_automatic_function_calling=True 一致）。
+    readonly=True 只帶唯讀工具（橋接 /ask 用）。
     """
-    return _client.chats.create(model=MODEL_NAME, config=_AGENT_CONFIG)
+    return _client.chats.create(model=MODEL_NAME, config=_READONLY_CONFIG if readonly else _AGENT_CONFIG)
 
 
 def send_message_with_retry(chat, prompt, max_retries=3, delay=65):
@@ -114,12 +122,14 @@ def send_message_with_retry(chat, prompt, max_retries=3, delay=65):
 def generate_oneshot_with_retry(prompt_parts, max_retries=3, delay=65, model=None):
     """
     無狀態的一次性 agentic 呼叫，供定時推播與安全哨兵使用：
-    建立帶工具的臨時 chat，送出單一訊息後即丟棄——模型在這一輪內仍可自主
-    呼叫工具進行多步調查，但不留任何跨輪 context。自動重試 429 並指數退避。
-    model 省略＝MODEL_NAME；定時報告傳 REPORT_MODEL_NAME。
+    建立「只帶唯讀工具」的臨時 chat，送出單一訊息後即丟棄——模型在這一輪內仍可自主
+    呼叫查詢工具進行多步調查，但不留任何跨輪 context、也改不了任何狀態。
+    為何唯讀：這些輪次沒有主人在看輸出，prompt 裡又夾著爬來的外部資料，被注入時
+    若手上有 tool_set_thresholds 之類的寫入工具，門檻可以每天漂 ±15 直到警報永不觸發。
+    自動重試 429 並指數退避。model 省略＝MODEL_NAME；定時報告傳 REPORT_MODEL_NAME。
     """
     def _do():
-        chat = _client.chats.create(model=model or MODEL_NAME, config=_AGENT_CONFIG)
+        chat = _client.chats.create(model=model or MODEL_NAME, config=_READONLY_CONFIG)
         return chat.send_message(prompt_parts)
     return _call_with_retry(_do, max_retries, delay)
 
@@ -154,7 +164,13 @@ def generate_oneshot_no_tools(prompt_parts, max_retries=3, delay=65, model=None)
         max_retries, delay)
 
 
-chat_sessions = {}  # chat_id -> {"chat": Chat, "created_date": "YYYY-MM-DD"}
+chat_sessions = {}  # session key -> {"chat": Chat, "created_date": "YYYY-MM-DD"}
+                    # key＝chat_id（主人對話，完整工具）或 (chat_id, "ro")（橋接唯讀對話，
+                    # 與主人的對話記憶分開：Hermes 轉來的問題不該讀到主人先前說過的話，反之亦然）
+
+
+def _session_key(chat_id, readonly=False):
+    return (chat_id, "ro") if readonly else chat_id
 chat_locks = {}     # chat_id -> asyncio.Lock，序列化同一對話的 Gemini 呼叫
 
 
@@ -177,30 +193,32 @@ def _today_taipei_str() -> str:
     return now_taipei().strftime("%Y-%m-%d")
 
 
-def is_session_fresh(chat_id) -> bool:
+def is_session_fresh(chat_id, readonly=False) -> bool:
     """
     此對話今天是否尚無活躍 session——即下一則訊息將以「全新記憶」開始
     （容器重啟、每日輪替後的第一則訊息）。供 handlers 在 prompt 中提醒模型
     誠實面對記憶重置，而非對使用者指涉的舊對話裝懂。
     """
-    entry = chat_sessions.get(chat_id)
+    entry = chat_sessions.get(_session_key(chat_id, readonly))
     return not (entry and entry.get("created_date") == _today_taipei_str())
 
 
-def get_or_create_chat(chat_id):
+def get_or_create_chat(chat_id, readonly=False):
     """
     取得 Telegram 對話的 Gemini session；每天自動輪替重置一次，
     防止對話 context 跨日永續膨脹（重要的長期狀態都存在 state.json，
     不依賴對話記憶，輪替不會遺失作物設定與積溫）。
+    readonly=True 取的是橋接專用的唯讀 session（獨立記憶、只帶唯讀工具）。
     """
     today = _today_taipei_str()
-    entry = chat_sessions.get(chat_id)
+    key = _session_key(chat_id, readonly)
+    entry = chat_sessions.get(key)
     if entry and entry.get("created_date") == today:
         return entry["chat"]
     if entry:
-        logger.info(f"♻️ [Session Manager] 對話 session 已逾一日，自動輪替重置 (chat_id={chat_id})。")
-    chat = start_new_gemini_chat()
-    chat_sessions[chat_id] = {"chat": chat, "created_date": today}
+        logger.info(f"♻️ [Session Manager] 對話 session 已逾一日，自動輪替重置 (key={key})。")
+    chat = start_new_gemini_chat(readonly=readonly)
+    chat_sessions[key] = {"chat": chat, "created_date": today}
     return chat
 
 

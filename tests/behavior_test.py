@@ -100,18 +100,50 @@ def test_strip_links():
 
 
 # ======================================================================
-# 3. 門檻指令防護 apply_threshold_command
-#    （只驗純文字面：標記一定被清除、不合規範圍被拒；不觸碰 state）
+# 3. 舊版控制標記：只清不套用（strip_legacy_markers）＋ 無人監看輪次只有唯讀工具
+#    （2026-10-31：[SET_*] 解析器拆掉，狀態只能經工具呼叫改；定時／哨兵／橋接用 READONLY_TOOLS）
 # ======================================================================
 def test_threshold_guard():
-    section("apply_threshold_command（門檻防護，純文字面）")
-    from agent.guard import apply_threshold_command
+    section("strip_legacy_markers（舊標記只清不套用）")
+    from agent.guard import strip_legacy_markers
+    from storage.state import load_state
     no_marker = "今天土壤偏乾，建議傍晚補水。"
-    check("無標記時原文不變", apply_threshold_command(no_marker) == no_marker)
-    bad = "建議 [SET_THRESHOLD: dry=90, wet=50, state=mature] 請注意"
-    out = apply_threshold_command(bad)  # dry>wet 不合規：清標記、拒套用、不寫 state
-    check("不合規標記被清除", "[SET_THRESHOLD" not in out, f"(實得 {out})")
+    check("無標記時原文不變", strip_legacy_markers(no_marker) == no_marker)
+    before = load_state()
+    # 合規的標記也一樣不套用——這條路已經不存在，只有工具呼叫能改狀態
+    legit = "建議 [SET_THRESHOLD: dry=22, wet=38, state=mature] 並 [SET_CROP: name=番茄] 請注意"
+    out = strip_legacy_markers(legit)
+    check("標記全部被清除", "[SET_" not in out, f"(實得 {out})")
     check("清除後保留其餘文字", "建議" in out and "請注意" in out)
+    after = load_state()
+    check("合規標記也不改 state（門檻／作物原封不動）",
+          (after.get("dry_threshold"), after.get("wet_threshold"), after.get("crop_name"))
+          == (before.get("dry_threshold"), before.get("wet_threshold"), before.get("crop_name")))
+
+
+def test_readonly_toolset():
+    section("READONLY_TOOLS（無人監看輪次的工具組不含任何寫入工具）")
+    from agent.tools import AGENT_TOOLS, READONLY_TOOLS
+    names = {t.__name__ for t in READONLY_TOOLS}
+    write_tools = {"tool_set_thresholds", "tool_set_crop", "tool_track_crop", "tool_finish_crop",
+                   "tool_set_target_gdd", "tool_start_crop_cycle", "tool_record_harvest_event",
+                   "tool_record_fertilizer_event", "tool_record_prediction", "tool_record_visual_assessment"}
+    check("唯讀組不含任何寫入／登記工具", not (names & write_tools), f"(混入 {names & write_tools})")
+    check("唯讀組是完整工具組的子集", names <= {t.__name__ for t in AGENT_TOOLS})
+    check("查詢類工具都在唯讀組", {"tool_get_realtime_sensor_data", "tool_get_weather_forecast",
+                                   "tool_query_daily_summaries", "tool_get_garden_status",
+                                   "tool_search_agri_knowledge", "tool_assess_disease_risk"} <= names)
+    import agent.session as S
+    ro_cfg_names = {t.__name__ for t in S._READONLY_CONFIG.tools}
+    check("session 的唯讀設定就是 READONLY_TOOLS", ro_cfg_names == names)
+    import inspect
+    src = inspect.getsource(S.generate_oneshot_with_retry)
+    check("一次性呼叫（定時推播／哨兵）用唯讀設定", "_READONLY_CONFIG" in src and "_AGENT_CONFIG" not in src)
+    check("橋接唯讀 session 與主人 session 是不同的 key",
+          S._session_key(123, True) != S._session_key(123, False))
+    import inspect as _i
+    from bridge import server as B
+    check("橋接 /ask 走 handle_message(readonly=True)", "readonly=True" in _i.getsource(B._ask))
 
 
 # ======================================================================
@@ -522,6 +554,7 @@ def main():
     test_cwa_alerts()
     test_report_resilience()
     test_harvest_calibration()
+    test_readonly_toolset()
     print_model_checklist()
     print(f"\n===== 結果：{_PASS} 通過 / {_FAIL} 失敗 =====")
     sys.exit(1 if _FAIL else 0)
