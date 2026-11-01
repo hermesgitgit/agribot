@@ -19,7 +19,8 @@ from logging_setup import logger
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # 原本 gpt-oss-120b 於 2026-09-03 下架（HTTP 410），改同家族 gpt-oss-20b（回傳格式相同）；
 # 可用環境變數 NVIDIA_MODEL 換模型，不必改碼。
-MODEL = os.getenv("NVIDIA_MODEL", "").strip() or "openai/gpt-oss-20b"
+# 2026-11-01：gpt-oss-20b 端點卡死（請求 150s 無回應），預設改 Nemotron 3 Ultra（免費金鑰實測可用、非中國公司）。
+MODEL = os.getenv("NVIDIA_MODEL", "").strip() or "nvidia/nemotron-3-ultra-550b-a55b"
 
 
 def is_configured() -> bool:
