@@ -26,9 +26,11 @@ from logging_setup import logger
 from storage.common import STATE_FILE_LOCK, atomic_write_json
 
 
-def save_fertilizer_event(text):
+def save_fertilizer_event(text) -> bool:
     """
     記錄一次施肥事件，追加至 events.json（持鎖 + 原子寫入）。
+    2026-11-02 審查修正 B（A4）：回傳是否成功——以前吞例外只記 log，呼叫端照樣回
+    「已記錄施肥事件」，使用者以為記了、實際沒寫進去。
     """
     timestamp = datetime.datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -50,8 +52,10 @@ def save_fertilizer_event(text):
             events = events[-10:]  # 僅保留最近 10 筆施肥記錄
             atomic_write_json(EVENTS_FILE, events)
         logger.info(f"✅ [Fertilizer Logger] 施肥事件已存檔: {event}")
+        return True
     except Exception as e:
         logger.error(f"❌ 寫入 events.json 失敗: {e}")
+        return False
 
 
 def load_fertilizer_events() -> str:

@@ -97,6 +97,14 @@ async def telegram_bot_loop():
                         await asyncio.wait_for(handle_message(message), timeout=300)
                     except asyncio.TimeoutError:
                         logger.error(f"⚠️ handle_message 逾時(>300s)，跳過 update {update['update_id']}")
+                        # 2026-11-02 審查修正 B（A3）：取消 await 不會停掉 to_thread 裡的模型執行緒；
+                        # 它的 inflight 旗標與取消標記由 agent/session.run_model_turn 維護——
+                        # 下一則訊息會被 handlers 擋下「請稍候」、舊執行緒的寫入工具一律不寫。
+                        # 2026-11-02 審查修正：以前靜默跳過，使用者只看到「輸入中…」然後沒下文
+                        try:
+                            await send_telegram_message(message["chat"]["id"], "⏳ 處理逾時，請再問一次。")
+                        except Exception as to_err:
+                            logger.warning(f"⚠️ 逾時通知發送失敗: {redact(to_err)}")
                     except Exception as e:
                         logger.error(f"⚠️ handle_message 例外: {redact(e)}")
                 # 不論該則是否需處理，都推進到此 update（已處理／已略過／已放棄）。

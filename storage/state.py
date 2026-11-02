@@ -125,6 +125,37 @@ def find_tracked_crop(crops, crop_name: str):
     return None
 
 
+class StateWriteError(Exception):
+    """2026-11-02 審查修正 B（A4）：state.json 落檔失敗（strict 模式的 update_state 才會拋）。"""
+
+
+def _today_str() -> str:
+    import datetime
+    from config import TZ_TAIPEI
+    return datetime.datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d")
+
+
+def resume_crop_entry(entry: dict, today: str = None) -> bool:
+    """
+    把一個作物帳標成在種（active=True）。若它原本是「已停止追蹤」，一併把 last_gdd_date
+    設為昨天並記 resumed_at。
+    2026-11-02 審查修正 B（A7）：以前 False→True 只翻旗標，引擎會從舊的 last_gdd_date 的
+    次日一路補算到昨天——停十天再恢復，十天的積溫被整段補回來（累計 100 變 190），
+    但那段期間作物根本沒在追蹤（多半是清園後重種、或誤停）。gdd_engine 的語意是
+    「從 last_gdd_date 的下一天算到昨天」，設成昨天 ＝ 今天起算、不補停止期間
+    （與 start_crop_cycle 的作法一致）。回傳是否發生了「恢復」。
+    """
+    import datetime
+    was_inactive = entry.get("active") is False
+    entry["active"] = True
+    if was_inactive:
+        today = today or _today_str()
+        yesterday = (datetime.datetime.strptime(today, "%Y-%m-%d") - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        entry["last_gdd_date"] = yesterday
+        entry["resumed_at"] = today
+    return was_inactive
+
+
 def set_crop_tracking(crop_name: str, active: bool):
     """
     將作物加入（active=True）或移出（active=False）每日 GDD 追蹤。
@@ -146,7 +177,8 @@ def set_crop_tracking(crop_name: str, active: bool):
                 acc_old = float(entry) if isinstance(entry, (int, float)) else 0.0
                 entry = {"accumulated_gdd": acc_old, "last_gdd_date": ""}
                 crops[key] = entry
-            entry["active"] = True
+            if resume_crop_entry(entry):  # 2026-11-02 審查修正 B（A7）：恢復追蹤不補算停止期間
+                logger.info(f"🌱 [State] 「{key}」恢復追蹤：自今天起算，停止期間的積溫不補回。")
             return (key, entry.get("accumulated_gdd", 0.0))
         # 停止追蹤
         if existing is None:
@@ -218,7 +250,8 @@ def start_crop_cycle(crop_name: str, note: str = "", today: str = None):
         entry["active"] = True
         return (key, old_acc, old_start)
 
-    return update_state(_apply)
+    # 2026-11-02 審查修正 B（A4）：播種起算經待確認流程落檔，寫入失敗必須讓呼叫端知道
+    return update_state(_apply, strict=True)
 
 
 def set_crop_target(crop_name: str, target):
@@ -248,19 +281,22 @@ def set_crop_target(crop_name: str, target):
     return update_state(_apply)
 
 
-def save_state(state_dict):
+def save_state(state_dict) -> bool:
     """
     將最新狀態保存至 state.json（持鎖 + 原子寫入，防止併發覆蓋與半截毀檔）。
+    2026-11-02 審查修正 B（A4）：回傳是否成功（以前一律吞例外只記 log，呼叫端無從得知）。
     """
     try:
         with STATE_FILE_LOCK:
             atomic_write_json(STATE_FILE, state_dict)
         logger.info(f"✅ [State Manager] 狀態已更新: {state_dict}")
+        return True
     except Exception as e:
         logger.error(f"❌ 寫入 state.json 失敗: {e}")
+        return False
 
 
-def update_state(mutator):
+def update_state(mutator, strict: bool = False):
     """
     交易性更新 state.json：在持鎖狀態下一氣呵成完成「讀-改-寫」三步。
     單把鎖只保護單次讀或單次寫並不夠——「load_state → 修改 → save_state」
@@ -268,9 +304,12 @@ def update_state(mutator):
     手動指令）會互相覆蓋（lost update）。所有狀態更新一律改經本函式。
     mutator 接收 state dict 並就地修改，其回傳值即為本函式的回傳值。
     （STATE_FILE_LOCK 為 RLock，內部的 load/save 重入取鎖是安全的。）
+    strict=True 時落檔失敗拋 StateWriteError（2026-11-02 審查修正 B（A4）：待確認事件的
+    落檔路徑需要知道有沒有真的寫進去，不能回成功文字）；預設維持舊行為只記 log。
     """
     with STATE_FILE_LOCK:
         state = load_state()
         result = mutator(state)
-        save_state(state)
+        if not save_state(state) and strict:
+            raise StateWriteError("state.json 寫入失敗")
         return result

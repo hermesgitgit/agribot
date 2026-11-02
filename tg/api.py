@@ -101,7 +101,10 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
     if capture is not None:
         # 橋接擷取模式：收進清單、不發真正的 Telegram API（避免與 Hermes 的轉述重複通知）。
         capture.append(text)
-        return
+        return True
+    # 2026-11-02 審查修正：回傳是否全部段落送達（哨兵據此決定要不要寫入警報冷卻），
+    # 原本一律回 None；既有呼叫端不看回傳值，不受影響
+    all_sent = True
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     loop = asyncio.get_running_loop()
@@ -152,8 +155,10 @@ async def send_telegram_message(chat_id, text, reply_markup=None):
                 logger.warning(f"⚠️ 發送 Telegram 網路錯誤（第 {attempt + 1} 次）: {redact(e)}")
                 await asyncio.sleep(2 ** attempt)
         if not sent:
+            all_sent = False
             logger.error(f"❌ 第 {idx + 1}/{len(chunks)} 段訊息最終未送達，內容前 60 字："
                          f"{redact(chunk[:60])}")
+    return all_sent
 
 
 async def send_typing_action(chat_id):

@@ -206,6 +206,25 @@ def test_confirmation_ab_questions():
     check("『幫我記』→ yes", cc("幫我記") == "yes")
 
 
+def test_confirmation_event_type():
+    # 2026-11-02 審查修正 D（A1）：事件關鍵詞依待確認事件類型判定；未來／意向句一律 unclear
+    section("確認語意：依事件類型判定、未來意向句不算確認")
+    from agent.pending import classify_confirmation as cc
+    # 外部審查第三輪重現：待確認收成時「我明天要施肥」以前被判 yes（收成誤落檔、新訊息被吞）
+    check("待確認 harvest『我明天要施肥』→ unclear", cc("我明天要施肥", "harvest") == "unclear")
+    check("待確認 harvest『好，收成記下來』→ yes", cc("好，收成記下來", "harvest") == "yes")
+    check("待確認 fertilizer『施肥不用記』→ no", cc("施肥不用記", "fertilizer") == "no")
+    check("待確認 harvest『施肥不用記』→ unclear（別種事件）", cc("施肥不用記", "harvest") == "unclear")
+    check("待確認 harvest『對』→ yes", cc("對", "harvest") == "yes")
+    check("待確認 harvest『不用』→ no", cc("不用", "harvest") == "no")
+    check("待確認 fertilizer『等一下再記』→ unclear", cc("等一下再記", "fertilizer") == "unclear")
+    check("待確認 harvest『我打算下週播種』→ unclear", cc("我打算下週播種", "harvest") == "unclear")
+    check("待確認 sow『播種記下來』→ yes", cc("播種記下來", "sow") == "yes")
+    check("待確認 harvest『這筆確認』→ yes（通用登記詞）", cc("這筆確認", "harvest") == "yes")
+    check("待確認 harvest『要施肥』→ unclear（「要」不再是確認詞）", cc("要施肥", "harvest") == "unclear")
+    check("不帶類型『收成不用記』→ no（舊行為保留）", cc("收成不用記") == "no")
+
+
 def test_capture_mode_blocks_pending():
     section("橋接擷取模式：不得建立會落檔的待確認事件")
     from tg.api import start_capture, stop_capture
@@ -545,6 +564,7 @@ def main():
     test_disease_two_pathway()
     test_crop_key_divergence()
     test_confirmation_ab_questions()
+    test_confirmation_event_type()
     test_capture_mode_blocks_pending()
     test_prompts_helpers()
     test_science_sanity()

@@ -10,6 +10,8 @@ data/
 # ---- 機密 ----
 .env
 .env.*
+# 2026-11-02 審查修正：範本 .env.example 只有變數名、沒有值，要進版控（gitignore 不吃行尾註解，故另起一行）
+!.env.example
 *.secret
 
 # ---- Python 快取 ----

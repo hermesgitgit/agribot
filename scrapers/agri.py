@@ -23,7 +23,7 @@ import re
 
 import requests
 
-from config import AGRI_API_KEY, AGRI_SUID, redact
+from config import AGRI_API_KEY, AGRI_SUID, SENSOR_STALE_HOURS, TZ_TAIPEI, redact
 from logging_setup import logger
 from storage.history import save_to_history
 from storage.temp_log import iso_to_taipei_str as _iso_to_taipei_str, merge_temp_log
@@ -178,6 +178,37 @@ def _get_param_list(headers) -> list:
     return _DEFAULT_PARAMS
 
 
+def _parse_point_time(point):
+    """把資料點的 time（阿龜 API 為 ISO 8601 UTC）解析成 aware datetime；無法解析回 None。
+    2026-11-02 審查修正 B（A2）。"""
+    if not isinstance(point, dict):
+        return None
+    raw = point.get("time") or point.get("timestamp") or point.get("created_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def assess_freshness(point, now=None):
+    """
+    2026-11-02 審查修正 B（A2）：判斷最新一筆感測資料是不是「舊值」。
+    回傳 (measured_at_iso 台北時間字串或 None, stale: bool, age_hours: float 或 None)。
+    來源沒給量測時間時無從判斷新鮮度：measured_at=None、stale=False（維持舊行為，不誤報離線）。
+    """
+    dt = _parse_point_time(point)
+    if dt is None:
+        return None, False, None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    age_h = (now - dt).total_seconds() / 3600.0
+    return dt.astimezone(TZ_TAIPEI).isoformat(timespec="minutes"), age_h > SENSOR_STALE_HOURS, round(age_h, 1)
+
+
 def _latest_point(data_list) -> dict:
     """從資料點清單取「time 最新」的一筆——realtime 是新→舊、history 是舊→新，
     一律以 time 取最大值最穩，不依賴排序方向。空清單回 {}。"""
@@ -255,6 +286,12 @@ def get_agriweather_data(include_advice: bool = False) -> str:
         # 不發任何健康警報。改為「至少要有一個實際數值」才算成功。
         values_present = sum(1 for v in scraped.values() if v is not None)
         sensors_scraped_ok = values_present > 0
+        # 2026-11-02 審查修正 B（A2）：來源最新一筆的量測時間若已是好幾小時前（感測器停止上傳），
+        # 以前仍回報成功、輸出不帶時間，哨兵與對話把半天前的舊值當成現況。
+        measured_at, stale, age_hours = assess_freshness(point, now_utc) if point else (None, False, None)
+        if stale:
+            logger.warning(f"⚠️ [Agri API] 感測器已 {age_hours} 小時未更新（最後量測 {measured_at}），"
+                           f"本輪數值標記為舊值（門檻 {SENSOR_STALE_HOURS} 小時）。")
         if not sensors_scraped_ok:
             if point:
                 logger.warning("⚠️ 取得感測列但所有欄位皆為空值（閘道可能漏傳上行），本輪視為失敗。")
@@ -284,6 +321,10 @@ def get_agriweather_data(include_advice: bool = False) -> str:
             "soil_temperature": fmt(scraped.get("soil_temperature"), "℃"),
             "soil_humidity": fmt(scraped.get("soil_humidity"), "%"),
             "soil_ec": fmt(scraped.get("soil_ec"), "ds/m"),
+            # 2026-11-02 審查修正 B（A2）：量測時間（台北時間 ISO）與新鮮度；歷史表改存量測時間
+            "measured_at": measured_at,
+            "stale": stale,
+            "stale_hours": age_hours,
             "irrigation_advice": irrigation_advice,
             "fertilization_advice": fertilization_advice,
             # key 名不再宣稱「6 小時」：這個區間實際涵蓋官方 API 回傳的整段歷史

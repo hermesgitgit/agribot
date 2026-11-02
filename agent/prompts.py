@@ -34,6 +34,22 @@ def has_severe_weather(weather_forecast: str) -> bool:
     return any(kw in (weather_forecast or "") for kw in SEVERE_WEATHER_KEYWORDS)
 
 
+def sensor_stale_notice(d) -> str:
+    """
+    2026-11-02 審查修正 B（A2）：感測資料 dict 標 stale 時，回一行要放在感測區塊最前面的警示；
+    新鮮時回空字串。定時推播、哨兵、對話的即時預抓與感測工具共用，措辭一致。
+    """
+    try:
+        if not isinstance(d, dict) or not d.get("stale"):
+            return ""
+        hours = d.get("stale_hours")
+        hours_txt = f"{hours:g}" if isinstance(hours, (int, float)) else "數"
+        when = f"（最後量測 {d.get('measured_at')}）" if d.get("measured_at") else ""
+        return f"⚠️ 感測器已 {hours_txt} 小時未更新，以下為舊值{when}，不代表現況。\n"
+    except Exception:
+        return ""
+
+
 def parse_sensor_block(sensor_data_json: str):
     """
     從 get_agriweather_data 的 JSON 回傳拆出組 prompt 所需的四段：
@@ -49,7 +65,9 @@ def parse_sensor_block(sensor_data_json: str):
         irr_advice = d.get("irrigation_advice", "無數據")
         fert_advice = d.get("fertilization_advice", "無數據")
         past_6h_text = d.get("history_summary") or d.get("past_6h_summary", "無數據")
-        sensor_display = json.dumps(sensors, ensure_ascii=False, indent=2)
+        if d.get("measured_at"):
+            sensors["measured_at"] = d["measured_at"]  # 2026-11-02 審查修正 B（A2）：帶上量測時間
+        sensor_display = sensor_stale_notice(d) + json.dumps(sensors, ensure_ascii=False, indent=2)
     except Exception:
         pass
     return sensor_display, irr_advice, fert_advice, past_6h_text
@@ -321,7 +339,7 @@ SYSTEM_INSTRUCTION = """
    - 若土壤濕度偏低且未來預報晴朗乾燥，請提供具體的「補水、灌溉建議」。
 6. **作物與生長階段記憶**：
    - 請在對話歷史中牢記使用者所種植的蔬菜種類（例如：空心菜、萵苣、青江菜）以及當前的生長階段（例如：菜苗、成長期、開花期、採收期），以微調你的農務建議。
-   - 如果使用者提及了蔬菜種類與階段的變更，請回覆已為其記錄下來，並在往後的分析中，以該新的作物種類與生長階段為準。
+   - 如果使用者提及了蔬菜種類與階段的變更，請先呼叫 `tool_set_crop`（換作物）／`tool_set_thresholds`（換生長階段）實際寫入，再告知使用者已記錄；沒有呼叫工具就不可宣稱已記錄（2026-11-02 審查修正：以前寫「回覆已為其記錄」，模型會只講不做），並在往後的分析中，以該新的作物種類與生長階段為準。
    - 如果使用者還沒有告訴你他種植的蔬菜種類或生長階段，你可以在建議的最後溫馨詢問他目前種植的是什麼蔬菜、幾週大。
 7. **多模態作物影像診斷與跨時影像對比**：
    - 系統若同時傳送兩張照片給你，**第一張相片為「歷史記錄照片（歷史影像）」**，**第二張相片為「當前最新照片（當下影像）」**。
@@ -370,7 +388,7 @@ SYSTEM_INSTRUCTION = """
     - 當使用者在對話中表達『他剛剛或今天**收成／採收／割收**了作物』（例如「我收成空心菜了」「今天割了一批菜」，或上傳收成的照片並提及採收），請呼叫 `tool_record_harvest_event` 登記。
     - 當使用者表達『他剛剛或今天**施肥／追肥**了』（例如「我施肥了」「剛追了肥」），請呼叫 `tool_record_fertilizer_event` 登記。
     - 當使用者表達『他今天**播種／定植／移植**了某作物』（例如「今天播了空心菜」「番茄苗定植了」），請呼叫 `tool_start_crop_cycle` 起算新一輪（同樣是待確認制；積溫歸零不可逆，所以要讓他有喊停機會）。
-    - 這兩個工具不會立即寫入，而是發起一則待確認。呼叫後，請在你的回覆中**明確告訴使用者你將為他登記這次收成／施肥**，並補一句「若只是隨口提及、不需記錄，回覆『不用』即可」，讓他有喊停的機會。收成登記會更新採收週期統計，可順帶提及。
+    - 這三個工具不會立即寫入，而是發起一則待確認。呼叫後，請在你的回覆中**明確告訴使用者你將為他登記這次收成／施肥**，並補一句「若只是隨口提及、不需記錄，回覆『不用』即可」，讓他有喊停的機會。收成登記會更新採收週期統計，可順帶提及。
     - **務必謹慎**：只有在使用者表達『他自己、已經、實際』做了這件事時才呼叫。若他只是在『詢問要不要收成／施肥』『考慮中』『提到別人收成』『討論一般作法』，**絕對不要**呼叫這些工具，正常回答即可。判斷不確定時，寧可不登記、改用一句話向他確認。
 15. **格式規範**：
     - 「農務分析與建議」類回覆請控制在 350 字內，條列式排版，使用繁體中文(台灣)，以利手機閱讀。

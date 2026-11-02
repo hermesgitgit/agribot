@@ -38,7 +38,7 @@ def generate_report_text(prompt, timeout=120) -> str:
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 2048,
+        "max_tokens": 4096,  # 2026-11-02 審查修正：推理型模型的思考也吃額度，2048 會把報告截斷
     }).encode("utf-8")
     req = urllib.request.Request(BASE_URL, data=body, headers={
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
@@ -49,8 +49,13 @@ def generate_report_text(prompt, timeout=120) -> str:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
         msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
-        # 推理型模型（gpt-oss）最終答案在 content；保險再看 reasoning_content
-        return (msg.get("content") or msg.get("reasoning_content") or "").strip()
+        # 推理型模型最終答案在 content。2026-11-02 審查修正：content 空就回 ''，
+        # 不再拿 reasoning_content 充數——那是模型的內心思考，不是給使用者的報告
+        content = (msg.get("content") or "").strip()
+        if not content:
+            logger.warning(f"⚠️ [Fallback] NVIDIA 回應 content 為空（finish_reason="
+                           f"{(data.get('choices') or [{}])[0].get('finish_reason')}），不採用 reasoning_content。")
+        return content
     except Exception as e:
         logger.warning(f"⚠️ [Fallback] NVIDIA 備援報告生成失敗: {redact(e)}")
         return ""

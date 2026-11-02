@@ -226,9 +226,10 @@ def _scrape_cwa_forecast() -> str:
             return res
             
     except Exception as e:
-        logger.error(f"❌ [Pre-fetch] 抓取氣象署資料失敗：{e}")
+        # 2026-11-02 審查修正：例外原文可能夾帶請求 URL／金鑰，進 log 與回傳前先遮罩
+        logger.error(f"❌ [Pre-fetch] 抓取氣象署資料失敗：{redact(e)}")
         report_scraper_result("cwa", False)
-        return f"無法取得天氣預報，錯誤原因：{e}"
+        return f"無法取得天氣預報，錯誤原因：{redact(e)}"
 
 
 def fetch_cwa_observation() -> dict:

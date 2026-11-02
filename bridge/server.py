@@ -86,6 +86,9 @@ async def _ask(text: str) -> str:
     # 還在 sleep 130 秒），但 CancelledError 會讓對話鎖的 async with 立刻退出。
     # 於是下一個請求或擁有者的訊息會拿到鎖、對同一個 ChatSession 併發送出。
     # 這道閘門確保同一時間只有一個橋接請求在飛；擁有者側的鎖仍由 handlers 負責。
+    # 2026-11-02 審查修正 B（A3）：逾時 cancel 後，handle_message 內的 run_model_turn 會設本請求的
+    # 取消標記（寫入型工具不寫）並保留 inflight 旗標到執行緒真正結束；期間再來的 /ask 會直接
+    # 收到「上一則還在處理中」而不進同一個唯讀 session。
     async with _ASK_GATE:
         token = start_capture()
         try:

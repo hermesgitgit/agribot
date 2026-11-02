@@ -31,12 +31,23 @@
 #   行為與舊版 enable_automatic_function_calling=True 一致。
 #   429 限流：舊 google.api_core.exceptions.ResourceExhausted → 新 errors.ClientError(code=429)。
 import asyncio
+import threading
 import time
 
 from google import genai
 from google.genai import errors, types
 
+# 2026-11-02 審查修正：google-genai 底層用 httpx，逾時／連線失敗會以 httpx 例外冒出來、
+# 不是 APIError；要能當暫時性錯誤重試。httpx 是 SDK 的既有依賴，仍防禦性退化。
+try:
+    import httpx
+    _HTTPX_TRANSIENT = (httpx.TimeoutException, httpx.ConnectError)
+except Exception:  # pragma: no cover
+    httpx = None
+    _HTTPX_TRANSIENT = ()
+
 from agent.prompts import SYSTEM_INSTRUCTION
+from agent.session_guard import _cancel_ctx  # 2026-11-02 審查修正 B（A3）
 from agent.tools import AGENT_TOOLS, READONLY_TOOLS
 from config import GEMINI_API_KEY, now_taipei
 from logging_setup import logger
@@ -48,7 +59,9 @@ MODEL_NAME = "gemini-3.8-flash"
 REPORT_MODEL_NAME = "gemini-3.1-pro-preview"
 AFC_MAX_CALLS = 10  # 單輪 ReAct 迴路最多自動執行幾次工具呼叫（防失控連環呼叫）
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
+# 2026-11-02 審查修正：SDK 預設無逾時，壅塞時一個請求可掛到 handle_message 的 300 秒上限；
+# 比照 vocab-bot 設 120 秒（HttpOptions.timeout 單位為毫秒，google-genai 1.47 確認）
+_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=120000))
 
 # 帶完整工具與系統指令的生成設定（取代舊版可重用的 GenerativeModel 物件）。
 _AGENT_CONFIG = types.GenerateContentConfig(
@@ -77,6 +90,8 @@ def is_transient_api_error(e) -> bool:
     """
     if isinstance(e, errors.ServerError):
         return True
+    if _HTTPX_TRANSIENT and isinstance(e, _HTTPX_TRANSIENT):
+        return True  # 2026-11-02 審查修正：連線逾時／連不上也屬「稍後重試即可」
     return isinstance(e, errors.ClientError) and getattr(e, "code", None) == 429
 
 
@@ -88,7 +103,7 @@ def _call_with_retry(fn, max_retries=3, delay=65):
     for attempt in range(max_retries):
         try:
             return fn()
-        except errors.APIError as e:
+        except Exception as e:  # 2026-11-02 審查修正：httpx 逾時不是 APIError，放寬捕捉、仍由下一行過濾
             if not is_transient_api_error(e):
                 raise
             code = getattr(e, "code", "?")
@@ -227,3 +242,59 @@ def reset_chat(chat_id):
     chat = start_new_gemini_chat()
     chat_sessions[chat_id] = {"chat": chat, "created_date": _today_taipei_str()}
     return chat
+
+
+# ----------------------------------------------------------------------
+# 2026-11-02 審查修正 B（A3）：逾時後模型執行緒續跑、卻操作同一 session 的防護
+# ----------------------------------------------------------------------
+# 問題：handle_message 被 wait_for／橋接逾時取消時，asyncio.to_thread 裡的 Gemini 呼叫
+# 「不會」跟著停（它在別的執行緒重試、可能還在 sleep），但 CancelledError 會讓對話鎖的
+# async with 立刻退出。下一則訊息於是拿到鎖、對同一個 ChatSession 併發送出，而舊執行緒
+# 手上還握著寫入工具（AFC 可能稍後才真的呼叫 tool_set_crop…）。
+# 兩道防線：
+#   (1) inflight 旗標：以 session key 為單位，工作執行緒「真正結束（finally）」才清除；
+#       逾時後旗標仍在，新訊息到來時直接回「上一則還在處理中」、不進 session、不排隊。
+#   (2) 取消標記：每個請求一個 threading.Event，經 contextvars 隨 to_thread 複製進工作
+#       執行緒；逾時時 set()。所有寫入型工具執行前檢查，已取消就回「本輪已逾時，未寫入」。
+# 取消標記本體放在 agent/session_guard.py（tools.py 要 import 它，而本模組 import tools，
+# 放這裡會循環引用）；這裡只負責 inflight 旗標與把兩者串進 to_thread。
+_inflight_keys = set()
+_inflight_lock = threading.Lock()
+
+
+def is_inflight(chat_id, readonly=False) -> bool:
+    """該對話（主人 session 或橋接唯讀 session）是否仍有模型執行緒在跑。"""
+    with _inflight_lock:
+        return _session_key(chat_id, readonly) in _inflight_keys
+
+
+async def run_model_turn(chat_id, readonly, fn, *args):
+    """
+    在工作執行緒跑一次模型呼叫 fn(*args)，並維護 inflight 旗標與取消標記。
+    - 旗標在工作執行緒內「開始時設、finally 清」：逾時取消 await 不會清掉它，
+      要等執行緒真的結束；若執行緒還沒開跑就被取消，fn 根本不執行。
+    - 取消標記在呼叫端 task 的 context 設好，to_thread 會複製 context，工具因此讀得到。
+    呼叫端應已持有該對話的 asyncio.Lock。
+    """
+    key = _session_key(chat_id, readonly)
+    flag = threading.Event()
+    _cancel_ctx.set(flag)
+
+    def _worker():
+        if flag.is_set():
+            return None  # 還沒開跑就被取消：不送模型、不碰 session
+        with _inflight_lock:
+            _inflight_keys.add(key)
+        try:
+            return fn(*args)
+        finally:
+            with _inflight_lock:
+                _inflight_keys.discard(key)
+
+    try:
+        return await asyncio.to_thread(_worker)
+    except asyncio.CancelledError:
+        flag.set()   # 執行緒仍在跑：之後任何寫入型工具都會看到已取消
+        logger.warning(f"⏱️ [Session] 請求被取消（逾時），模型執行緒仍在背景收尾；"
+                       f"已設取消標記、inflight 旗標待執行緒結束才清除 (key={key})。")
+        raise

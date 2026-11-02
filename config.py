@@ -84,6 +84,16 @@ DEFAULT_WET_THRESHOLD = 40.0   # 積水警戒：高於即告警（接近壤土�
 WET_THRESHOLD_MAX = 60.0       # 積水門檻合法上限：體積含水率不可能超過此值
 
 # ----------------------------------------------------------------------
+# 感測資料新鮮度門檻（小時）—— 2026-11-02 審查修正 B（A2）
+# ----------------------------------------------------------------------
+# 阿龜閘道的上傳節奏：realtime 端點回 10 分鐘間隔的近期點，hourly-history 每小時一點；
+# 哨兵每小時巡檢一次。取「較粗的那個來源（每小時）」的 3 倍 ＝ 3 小時：漏傳一兩次上行
+# 不算離線（閘道偶發漏傳是常態），連續三小時沒新資料才判定感測器停止更新。
+# 超過門檻：最新一筆仍會回傳但標 stale=True，prompt 前加「已 N 小時未更新」、
+# 哨兵不拿舊值發乾旱／積水／鹽害警報、改發一次「感測器離線」健康警示。
+SENSOR_STALE_HOURS = 3.0
+
+# ----------------------------------------------------------------------
 # 資料檔路徑（NAS volume 掛載於 /app/data）
 # ----------------------------------------------------------------------
 DATA_DIR = "/app/data"
@@ -117,7 +127,8 @@ def redact(text) -> str:
     /app/data/logs/ 長期留存。
     """
     s = str(text)
-    for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, AGRI_PASSWORD, AGRI_API_KEY, CWA_API_KEY, HEARTBEAT_URL, BRIDGE_SHARED_SECRET):
+    # 2026-11-02 審查修正：AGRI_SUID 也會嵌在阿龜請求 URL 裡，一併遮罩
+    for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, AGRI_PASSWORD, AGRI_API_KEY, AGRI_SUID, CWA_API_KEY, HEARTBEAT_URL, BRIDGE_SHARED_SECRET):
         if secret:
             s = s.replace(secret, "***")
     return s

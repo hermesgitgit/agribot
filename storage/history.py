@@ -26,13 +26,31 @@ from logging_setup import logger
 from storage.common import STATE_FILE_LOCK
 
 
+def _measured_timestamp(measured_at):
+    """把 measured_at（ISO 字串）轉成歷史表用的台北時間 'YYYY-MM-DD HH:MM:SS'；無或壞值回 None。"""
+    if not measured_at:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(measured_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ_TAIPEI)
+        return dt.astimezone(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
 def save_to_history(data_dict):
     """
     將單次抓取的感測器數據加上時間戳記，存入 SQLite 的 sensor_history 表。
     （舊版 JSON 受限於整檔重寫成本只保留 150 筆；改用資料庫後原始數據永久保存，
       成為可回溯的長期檔案庫——prompt 膨脹的防護移至讀取端的 LIMIT。）
     """
-    timestamp = datetime.datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    # 2026-11-02 審查修正 B（A2）：timestamp 欄位改存「量測時間」（來源資料點的 time，
+    # 由 scrapers/agri.py 以 measured_at 帶入），沒有量測時間才退回抓取時間。
+    # 感測器停止更新時，以前每小時抓到同一筆舊值卻以不同的抓取時間各存一列，歷史看起來
+    # 像是持續在量；改存量測時間後同一筆只會留一列（timestamp 是主鍵、INSERT OR REPLACE）。
+    timestamp = _measured_timestamp(data_dict.get("measured_at")) or \
+        datetime.datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
 
     record = (
         timestamp,

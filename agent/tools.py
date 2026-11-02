@@ -25,8 +25,9 @@ import re
 
 from agent.guard import MAX_THRESHOLD_STEP
 from agent.pending import _current_chat_ctx, _set_pending_event
+from agent.session_guard import cancelled_write_guard  # 2026-11-02 審查修正 B（A3）：逾時取消後寫入工具不寫
 from config import DEFAULT_DRY_THRESHOLD, DEFAULT_WET_THRESHOLD, WET_THRESHOLD_MAX, now_taipei
-from agent.prompts import build_disease_report, build_state_summary
+from agent.prompts import build_disease_report, build_state_summary, sensor_stale_notice
 from logging_setup import logger
 from science.gdd import CROP_GDD_DATABASE, lookup_crop_info, match_crop_key
 from science.vision import crosscheck_stage
@@ -37,14 +38,23 @@ from storage.harvest import get_harvest_cadence_summary
 from storage.knowledge import search_knowledge
 from storage.history import load_history_summary
 from storage.predictions import load_prediction_feedback, save_prediction
-from storage.state import crop_target_gdd, load_state, set_crop_target, set_crop_tracking, update_state
+from storage.state import (
+    crop_target_gdd, find_tracked_crop, load_state, resume_crop_entry, set_crop_target,
+    set_crop_tracking, update_state,
+)
 from storage.summaries import load_daily_summaries
 from storage.vision_log import load_visual_history, record_visual_assessment
 
 
 def tool_get_realtime_sensor_data() -> str:
-    """抓取阿龜物聯網的最新即時感測數據（氣溫、空氣濕度、土壤溫度、土壤含水率、土壤EC）與過去趨勢摘要。透過官方 API，數秒內回應、不需啟動瀏覽器；需要最新現場數據時即可呼叫，同一輪對話中切勿重複呼叫。（註：阿龜平台原生的灌溉/施肥文字建議僅在定時推播時提供，本工具不含。）回傳 JSON 字串。"""
-    return get_agriweather_data()
+    """抓取阿龜物聯網的最新即時感測數據（氣溫、空氣濕度、土壤溫度、土壤含水率、土壤EC）與過去趨勢摘要。透過官方 API，數秒內回應、不需啟動瀏覽器；需要最新現場數據時即可呼叫，同一輪對話中切勿重複呼叫。（註：阿龜平台原生的灌溉/施肥文字建議僅在定時推播時提供，本工具不含。）回傳 JSON 字串，含 measured_at（量測時間）與 stale（True 表示感測器已數小時未更新、數值為舊值，回答時務必告知使用者並避免據此下澆水／施肥結論）。"""
+    raw = get_agriweather_data()
+    # 2026-11-02 審查修正 B（A2）：舊值時在 JSON 前加一行警示，模型不必自己解讀 stale 旗標
+    try:
+        import json as _json
+        return sensor_stale_notice(_json.loads(raw)) + raw
+    except Exception:
+        return raw
 
 
 def tool_get_weather_forecast() -> str:
@@ -78,6 +88,9 @@ def tool_get_garden_status() -> str:
 
 def tool_set_thresholds(dry: float, wet: float, lifecycle_stage: str) -> str:
     """調整本地哨兵系統的土壤濕度警戒門檻。dry=乾燥警戒%（低於即告警）、wet=積水警戒%（高於即告警）、lifecycle_stage=生長階段代碼（如 seedling/vegetative/flowering/mature）。注意：土壤含水率是「體積含水率」，不是 0~100 的相對濕度——土壤完全飽和也只有約 40~50%，壤土田間容水量（澆透排水後的穩定值）約 20~30%，所以 wet 應設在該地飽和參考值略上方（通常 35~45），dry 設在凋萎點略上方（通常 15~25）。安全限制：必須 0 < dry < wet < 60 且單次調幅不得超過±15個百分點，違反時會被拒絕並回傳原因。成功或失敗都會回傳結果訊息，請據此告知使用者。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     try:
         new_dry = float(dry)
         new_wet = float(wet)
@@ -121,29 +134,43 @@ def tool_set_thresholds(dry: float, wet: float, lifecycle_stage: str) -> str:
 
 def tool_set_crop(crop_name: str) -> str:
     """切換目前種植的作物（會自動模糊比對內建 GDD 資料庫：水稻/玉米/番茄/萵苣/草莓/馬鈴薯/高麗菜/小黃瓜/空心菜，比對不到則以自訂名稱用預設參數）。各作物的累計積溫獨立保存，切換不會清除。僅在使用者明確表示更換作物時呼叫。回傳切換結果。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     new_crop = str(crop_name).strip()[:40]
     if not new_crop:
         return "❌ 切換失敗：作物名稱不可為空。"
-    matched = None
+    canonical = None
     for k in CROP_GDD_DATABASE.keys():
         if new_crop.split()[0] in k or k.split()[0] in new_crop:
-            matched = k
+            canonical = k
             break
-    if not matched:
-        matched = new_crop
+    if not canonical:
+        canonical = new_crop
     def _apply(state):
-        state["crop_name"] = matched
-        entry = state.setdefault("crops", {}).setdefault(matched, {"accumulated_gdd": 0.0, "last_gdd_date": ""})
-        entry["active"] = True  # 設為焦點即視為在種、納入每日 GDD 追蹤
-        return entry.get("accumulated_gdd", 0.0)
+        crops = state.setdefault("crops", {})
+        # 2026-11-02 審查修正 B（A6）：比照 storage/state.py，先找 state 裡既有的鍵再沿用，
+        # 否則「龍鬚菜」已有 120 GDD 的帳，切換時會以標準鍵另開一個 0 GDD 的重複帳。
+        key = find_tracked_crop(crops, new_crop) or canonical
+        state["crop_name"] = key
+        entry = crops.get(key)
+        if not isinstance(entry, dict):
+            acc_old = float(entry) if isinstance(entry, (int, float)) else 0.0
+            entry = {"accumulated_gdd": acc_old, "last_gdd_date": ""}
+            crops[key] = entry
+        resume_crop_entry(entry)  # 設為焦點即視為在種、納入每日 GDD 追蹤（停過的從今天起算）
+        return key, entry.get("accumulated_gdd", 0.0)
 
-    acc = update_state(_apply)
+    matched, acc = update_state(_apply)
     logger.info(f"🔄 [Agentic Closed-Loop / 工具呼叫] 焦點作物已設為: {matched}")
     return f"✅ 焦點作物已設為：{matched}（該作物目前累計 GDD: {acc} ℃-day，並已納入每日追蹤）。"
 
 
 def tool_track_crop(crop_name: str) -> str:
     """當使用者表達『他「同時、額外」也種了另一種作物』（例如「我這畦也種了萵苣」「旁邊還種了一排小白菜」），呼叫此工具把該作物加入每日 GDD 追蹤，與現有作物並行累積（各自獨立、共用同一塊地的溫度）。這不會改變對話焦點作物。立即生效（加入追蹤是低風險、可逆操作，無需確認）；呼叫後請在回覆中告知使用者已加入、並說明若是誤會可請他說「停止追蹤該作物」。同一則訊息提到多種作物時可分別呼叫本工具多次。切勿在使用者只是『詢問』『考慮』『提到別人種』時呼叫。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     crop = str(crop_name).strip()[:40]
     if not crop:
         return "（作物名稱不可為空）"
@@ -154,6 +181,9 @@ def tool_track_crop(crop_name: str) -> str:
 
 def tool_finish_crop(crop_name: str) -> str:
     """當使用者表達『某作物已「採收完畢、清園、拔除」、不再種植』（例如「空心菜整畦拔光了」「番茄這季收完清掉了」），呼叫此工具停止該作物的每日 GDD 累積（保留歷史積溫，僅不再往上加）。立即生效（停止追蹤可逆，無需確認）；呼叫後請在回覆中告知使用者已停止、歷史積溫仍保留。切勿在使用者只是『割收一次但繼續種』（那是 tool_record_harvest_event）或只是討論時呼叫。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     crop = str(crop_name).strip()[:40]
     if not crop:
         return "（作物名稱不可為空）"
@@ -166,6 +196,9 @@ def tool_finish_crop(crop_name: str) -> str:
 
 def tool_record_visual_assessment(crop_name: str, stage: str, vigor: int, coverage: int, health_note: str) -> str:
     """看完使用者上傳的「作物照片」後呼叫此工具，登記一筆結構化視覺評估，存入視覺生長日誌以長期追蹤。crop_name=照片中的作物（由圖說/你的辨識/當前焦點作物判定）；stage=你從外觀判定的生長階段（用：初期（幼苗）/發育期（旺盛生長）/中期（滿冠）/後期（成熟/採收） 其一）；vigor=生長勢 1~5（1萎黃弱、5濃綠旺）；coverage=冠層覆蓋度 1~5（1零星裸露、5完全覆蓋）；health_note=一句話健康/病蟲害觀察。系統會自動把你的視覺階段與 GDD 積溫推估的階段交叉檢核（照片是現場真相、GDD 是模型預測），並把檢核結論回傳給你——若兩者背離（照片落後或超前），請在回覆中向使用者點出並研判原因。即時寫入、無需確認。只在「確實收到作物照片」時呼叫一次。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     matched = match_crop_key(str(crop_name).strip()[:40]) if crop_name else "未指定作物"
     rec = record_visual_assessment(matched, stage, vigor, coverage, health_note)
     # 與 GDD 推估階段交叉檢核
@@ -196,6 +229,9 @@ def tool_query_visual_history(crop_name: str = "") -> str:
 
 def tool_record_prediction(metric: str, predicted_value: float, target_date: str, note: str) -> str:
     """登記一筆可驗證的量化預測，系統將於 target_date 過後自動以當日實測平均值驗證並回饋誤差給你。metric 必須是 air_temperature/air_humidity/soil_temperature/soil_humidity/soil_ec 之一；predicted_value 為你預測的當日平均值；target_date 格式 YYYY-MM-DD（今天起14天內）；note 為一句話的預測依據（100字內）。每當你做出量化判斷（如「明天土壤濕度約降至35%」）時呼叫。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     return save_prediction(metric, predicted_value, target_date, note)
 
 
@@ -216,6 +252,9 @@ def tool_get_et0_evapotranspiration() -> str:
 
 def tool_record_harvest_event(crop_hint: str = "", note: str = "") -> str:
     """當使用者在對話中表達『他剛剛或今天採收／收成／割收了作物』時呼叫此工具，登記一次收成事件以更新採收週期統計。crop_hint 為使用者提到的作物（可留空，預設用當前設定作物）；note 為簡短備註（如數量描述，可留空）。注意：本工具不會立即寫入，而是發起一則確認，等待使用者下一句確認後才正式記錄。請在你的回覆中告訴使用者你將為他登記這次收成、並說明若只是隨口提及可以喊停。切勿在使用者只是『考慮』『詢問』『提到他人』收成時呼叫。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     if _current_chat_ctx.get() is None:
         return "（無法登記：缺少對話內容）"
     note_full = (f"{crop_hint} {note}".strip())[:100]
@@ -230,6 +269,9 @@ def tool_record_harvest_event(crop_hint: str = "", note: str = "") -> str:
 
 def tool_start_crop_cycle(crop_name: str, note: str = "") -> str:
     """當使用者表達『他今天（或剛剛）播種／播下／定植／移植了某作物』（例如「今天播了空心菜」「番茄苗定植了」「秋葵種下去了」）時呼叫，為該作物開始新的一輪：累計積溫歸零、記下起算日、納入每日追蹤。有了起算日，之後首次採收的累計積溫才能用來校準這塊地的成熟目標。注意：本工具不會立即寫入，而是發起一則確認（積溫歸零不可逆），請在回覆中告訴使用者你將為他起算、若只是討論可回覆「不用」取消。切勿在使用者只是『考慮要種』『問什麼時候播』『提到別人種』時呼叫；「同時也種了」但沒說今天播種的，用 tool_track_crop。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     if _current_chat_ctx.get() is None:
         return "（無法登記：缺少對話內容）"
     crop = str(crop_name or "").strip()[:40]
@@ -243,6 +285,9 @@ def tool_start_crop_cycle(crop_name: str, note: str = "") -> str:
 
 def tool_set_target_gdd(crop_name: str, target_gdd: float) -> str:
     """設定某作物的成熟目標積溫（℃-day）。適用時機：使用者明確要求改目標（例：「把空心菜的目標改成 350」），或 /harvest_stats、tool_query_harvest_cadence 回傳的首採積溫校準建議被使用者採納時。立即生效、可逆（再設一次或請他用 /target 作物 reset 回預設）。不要未經使用者同意就依校準建議自行呼叫。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     crop = str(crop_name or "").strip()[:40]
     try:
         num = float(target_gdd)
@@ -259,6 +304,9 @@ def tool_set_target_gdd(crop_name: str, target_gdd: float) -> str:
 
 def tool_record_fertilizer_event(note: str = "") -> str:
     """當使用者在對話中表達『他剛剛或今天施肥／追肥／施了某種肥』時呼叫此工具，登記一次施肥事件。note 為使用者描述（如『施了氮肥』『撒了有機肥』，可留空）。注意：本工具不會立即寫入，而是發起一則確認，等待使用者下一句確認後才正式記錄。請在你的回覆中告訴使用者你將為他登記這次施肥、並說明若只是隨口提及可以喊停。切勿在使用者只是『考慮』『詢問』施肥時呼叫。"""
+    cancelled = cancelled_write_guard()  # 2026-11-02 審查修正 B（A3）：本輪已逾時就不寫
+    if cancelled:
+        return cancelled
     if _current_chat_ctx.get() is None:
         return "（無法登記：缺少對話內容）"
     ok = _set_pending_event(_current_chat_ctx.get(), "fertilizer", (note or "使用者登記施肥")[:100])

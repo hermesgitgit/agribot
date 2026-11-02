@@ -44,6 +44,11 @@ def _resolve_crop(state, crop_hint: str = "") -> str:
 HARVEST_TABLE_READY = False
 
 
+class HarvestWriteError(Exception):
+    """2026-11-02 審查修正 B（A4）：割收記錄落檔失敗。以前 record_harvest 回「❌ 割收記錄失敗」
+    字串，待確認流程無法與成功訊息區分，事件就這樣被 pop 掉、永久遺失。"""
+
+
 # 距上次割收超過這個天數，就不視為同一輪的再生間隔，而是新一輪的基準點。
 # 空心菜這類多次採收的葉菜再生約 7~14 天，抓 45 天足以容納季節性放慢，
 # 又能擋掉清園休耕、漏登記造成的超長空窗污染節律統計。
@@ -126,7 +131,10 @@ def record_harvest(note: str = "", crop_hint: str = "") -> str:
                 return (f"⚠️ 今天（{today_str}）已登記過一次 {crop_name} 的割收，"
                         f"為避免 0 天間隔污染週期統計，本次不重複登記。")
 
-            if prev is None:
+            # 2026-11-02 審查修正 B（A5）：first_in_cycle 以前算了沒用——重新播種（新 cycle_start）
+            # 後的首採仍拿上一輪最後一次割收當 prev，gdd_since 變成 100 − 700 = −600 寫進節律統計。
+            # 本輪尚無採收就是首採：不計與上一輪的間隔。
+            if prev is None or first_in_cycle:
                 is_first = 1
                 days_since = None
                 gdd_since = None
@@ -160,7 +168,7 @@ def record_harvest(note: str = "", crop_hint: str = "") -> str:
             conn.close()
     except Exception as e:
         logger.error(f"❌ [Harvest] 寫入割收記錄失敗: {e}")
-        return f"❌ 割收記錄失敗：{e}"
+        raise HarvestWriteError(str(e)) from e  # 2026-11-02 審查修正 B（A4）：讓待確認流程把事件放回
 
     logger.info(f"🌾 [Harvest] 已登記割收: {crop_name} @ {today_str}, 距上次 {days_since} 天, 期間 GDD {gdd_since}, 本輪起算 {cycle_start or '無'}")
 
