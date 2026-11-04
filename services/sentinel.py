@@ -268,10 +268,14 @@ async def hourly_safety_check_loop():
                 ai_message = strip_links(ai_message, source_tag="哨兵")
 
                 sent_ok = await send_telegram_message(chat_id, ai_message)
-                record_push("緊急安全警報", ai_message)
+                # 2026-11-03 審查修正 E（A3）：送達才 record_push——推播日誌與 Hermes 信箱不能
+                # 收到使用者其實沒看到的警報（以前冷卻已改成送達才寫，record_push 卻還是無條件寫）
                 if sent_ok:
+                    record_push("緊急安全警報", ai_message)
                     last_alert_sent.update(pending_cooldown)  # 2026-11-02 審查修正：送達才進冷卻
-                logger.info("✅ [Sentinel] 緊急預警推播成功發送。")
+                    logger.info("✅ [Sentinel] 緊急預警推播成功發送。")
+                else:
+                    logger.error("❌ [Sentinel] 緊急預警推播未送達 Telegram，不寫推播日誌、不進冷卻。")
                 
         except Exception as e:
             logger.warning(f"⚠️ [Sentinel] 安全巡檢迴圈發生異常，將在 60 秒後重試: {redact(e)}")
@@ -287,8 +291,9 @@ async def hourly_safety_check_loop():
                     fb_text = strip_links(fb_text, source_tag="哨兵(備援)")
                     fb_text = "🛟（Gemini 暫時壅塞，本則緊急警報由備援模型生成）\n\n" + fb_text
                     fb_sent = bool(await send_telegram_message(fb_chat, fb_text))
-                    record_push("緊急安全警報(備援)", fb_text)
-                    logger.info("✅ [Sentinel] 已用備援模型補發緊急警報。")
+                    if fb_sent:  # 2026-11-03 審查修正 E（A3）：送達才 record_push
+                        record_push("緊急安全警報(備援)", fb_text)
+                        logger.info("✅ [Sentinel] 已用備援模型補發緊急警報。")
             # 2026-11-02 審查修正：備援也失敗（或根本不是暫時性錯誤）時，至少把本輪觸發的
             # 警報原文直接推給使用者——警報不可消失；只有真的送達才寫冷卻時間
             if not fb_sent and trigger_alerts and fb_chat:
@@ -296,8 +301,9 @@ async def hourly_safety_check_loop():
                             "⚠️ 模型暫時無法產生建議，以下為原始警報：\n\n" + "\n".join(trigger_alerts))
                 try:
                     fb_sent = bool(await send_telegram_message(fb_chat, raw_text))
-                    record_push("緊急安全警報(原始)", raw_text)
-                    logger.info("✅ [Sentinel] 已直接推送原始警報文字。")
+                    if fb_sent:  # 2026-11-03 審查修正 E（A3）：送達才 record_push
+                        record_push("緊急安全警報(原始)", raw_text)
+                        logger.info("✅ [Sentinel] 已直接推送原始警報文字。")
                 except Exception as raw_err:
                     logger.error(f"❌ [Sentinel] 原始警報推送也失敗: {redact(raw_err)}")
             if fb_sent:

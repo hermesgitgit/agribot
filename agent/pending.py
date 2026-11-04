@@ -216,6 +216,9 @@ def sweep_expired_pending_events() -> list:
 #   (c) 明確的登記措辭（幫我記／請登記／記下來…）仍視為肯定——它們本身就指向登記這件事。
 #   其餘一律 unclear：訊息照常進 AI 對話，待確認事件保留，逾時由 watchdog 默認落檔（行為不變）。
 # 否定優先於肯定（「好，不用記了」是取消）；含問號的一律 unclear（問句不是確認也不是拒絕）。
+# 2026-11-03 審查修正 E（A1）：判斷順序固定為 (1) 整句等於短確認／否定詞 → (2) 針對本事件的明確
+#   取消／登記措辭（_DENY_PHRASES／_AFFIRM_PHRASES、本事件詞＋否定詞）→ (3) 未來／意向標記 → unclear
+#   → (4) 其餘「事件詞＋確認詞」規則。明確喊停不能被句尾的「明天再說」搶走。
 _DENY_EXACT = ("不用", "不要", "取消", "不記", "免了", "算了", "no", "nope", "不是", "不對", "錯了",
                "先不要", "先不用", "不需要", "沒有要", "別記", "別登", "不必", "不用記", "不要記",
                "不用了", "不要了", "不必了", "取消吧", "不用啦", "不要啦")
@@ -269,9 +272,6 @@ def classify_confirmation(text: str, event_type=None):
     t_scan = t
     for pattern in _AB_QUESTION_PATTERNS:
         t_scan = t_scan.replace(pattern, "")   # 長樣式排前面，避免被部分吃掉
-    # 2026-11-02 審查修正 D（A1）：未來／意向句（「我明天要施肥」「等一下再記」）是新訊息，不是確認
-    if any(m in t_scan for m in _FUTURE_INTENT_MARKERS):
-        return "unclear"
     own_words = _EVENT_WORDS_BY_TYPE.get(event_type)
     if own_words is None:
         mentions_event = any(w in t_scan for w in _EVENT_WORDS)
@@ -282,14 +282,23 @@ def classify_confirmation(text: str, event_type=None):
         if not mentions_own and any(w in t_scan for w in other_words):
             return "unclear"
         mentions_event = mentions_own or any(w in t_scan for w in _GENERIC_EVENT_WORDS)
-    # (b) 指向事件 ＋ 否定詞 → 取消（否定優先）；明確取消措辭（不用記／別記…）亦同
+    has_deny = any(w in t_scan for w in _DENY_WORDS)
+    # 2026-11-03 審查修正 E（A1）：針對本事件的「明確取消／登記措辭」要排在未來詞檢查之前。
+    # 外部審查第四輪重現：待確認收成時「這筆收成不用記了，明天再說」被「明天」搶先判 unclear，
+    # 事件保留、逾時 sweep 自動落檔——明確喊停反而被記下來。
+    # (b) 明確取消措辭（不用記／別記…）或「本事件詞＋否定詞」→ 取消（否定優先）
     if any(w in t_scan for w in _DENY_PHRASES):
         return "no"
-    if mentions_event and any(w in t_scan for w in _DENY_WORDS):
+    if mentions_event and has_deny:
         return "no"
-    # (c) 明確登記措辭 → 肯定（「幫我記」「記下來」「確認登記」本身就指向登記）
-    if any(w in t_scan for w in _AFFIRM_PHRASES) and not any(w in t_scan for w in _DENY_WORDS):
+    # (c) 明確登記措辭 → 肯定（「幫我記」「記下來」「確認登記」本身就指向登記；
+    #     「好，收成記下來，明天再施肥」後半是新預告，但前半已明確要求登記）
+    if any(w in t_scan for w in _AFFIRM_PHRASES) and not has_deny:
         return "yes"
+    # 2026-11-02 審查修正 D（A1）：未來／意向句（「我明天要施肥」「等一下再記」）是新訊息，不是確認
+    # （2026-11-03 審查修正 E（A1）：移到明確取消／登記措辭之後，只攔沒有明確措辭的意向句）
+    if any(m in t_scan for m in _FUTURE_INTENT_MARKERS):
+        return "unclear"
     # (b) 指向事件 ＋ 確認詞 → 肯定（「對，記下來」「確認要記錄空心菜」「收成好」）
     if mentions_event and any(w in t_scan for w in _AFFIRM_WORDS):
         return "yes"

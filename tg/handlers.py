@@ -68,6 +68,46 @@ from tg.api import (
 from watchdog import SCRAPER_FAILURE_ALERT_THRESHOLD, WATCHDOG_LOCK, WATCHDOG_STATE
 
 
+def _fmt_sensor_reading(r, header):
+    """/status／耕地快照的感測讀數排版（即時、歷史退回兩條路共用）。"""
+    return (
+        f"{header}\n"
+        f"  🌡️ 氣溫 {r.get('air_temperature', '—')} / 💧 空氣濕度 {r.get('air_humidity', '—')}\n"
+        f"  🎚️ 土溫 {r.get('soil_temperature', '—')} / 🌊 土壤濕度 {r.get('soil_humidity', '—')} / 🧪 EC {r.get('soil_ec', '—')}"
+    )
+
+
+def _fmt_measured_at(measured_at) -> str:
+    """把感測資料的 measured_at（ISO 字串）轉成台北時間 MM-DD HH:MM；缺值回「不明」、壞值原樣回。"""
+    if not measured_at:
+        return "不明"
+    try:
+        import datetime as _dt
+        dt = _dt.datetime.fromisoformat(str(measured_at).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(now_taipei().tzinfo)
+        return dt.strftime("%m-%d %H:%M")
+    except Exception:
+        return str(measured_at)
+
+
+def format_sensor_snapshot(fresh: dict) -> str:
+    """
+    2026-11-03 審查修正 E（A2）：/status／耕地快照顯示剛抓到的感測資料時，一律帶量測時間
+    （measured_at）；stale 為真時標「⚠️ 感測器已 N 小時未更新（最後量測 …）」而不是「即時」——
+    以前只要 API 有回值就寫「即時（HH:MM 剛抓取）」，半天前的舊讀數被當成現況看。
+    """
+    measured_txt = _fmt_measured_at(fresh.get("measured_at"))
+    if fresh.get("stale"):
+        hours = fresh.get("stale_hours")
+        hours_txt = f"{hours:g}" if isinstance(hours, (int, float)) else "數"
+        header = (f"⚠️ 感測器已 {hours_txt} 小時未更新（最後量測 {measured_txt}），"
+                  f"以下為舊值、不代表現況")
+    else:
+        header = f"即時（{now_taipei().strftime('%H:%M')} 剛抓取，量測於 {measured_txt}）"
+    return _fmt_sensor_reading(fresh, header)
+
+
 async def handle_local_command(chat_id, text) -> bool:
     """
     處理本地輕量指令（/help, /status, /gdd, /threshold, /crop）。
@@ -133,12 +173,6 @@ async def handle_local_command(chat_id, text) -> bool:
         # 快照必須是「現在」的讀數：直接打阿龜 API 抓即時值（約 1~2 秒、零 AI 額度），
         # 不再拿最近一筆歷史記錄充數——那是哨兵上一輪（最多一小時前）的快照。
         # API 失敗才退回最近一筆歷史，並明確標示它是舊資料與時間。
-        def _fmt_reading(r, header):
-            return (
-                f"{header}\n"
-                f"  🌡️ 氣溫 {r.get('air_temperature', '—')} / 💧 空氣濕度 {r.get('air_humidity', '—')}\n"
-                f"  🎚️ 土溫 {r.get('soil_temperature', '—')} / 🌊 土壤濕度 {r.get('soil_humidity', '—')} / 🧪 EC {r.get('soil_ec', '—')}"
-            )
         latest = None
         try:
             raw = await asyncio.to_thread(get_agriweather_data)
@@ -147,7 +181,8 @@ async def handle_local_command(chat_id, text) -> bool:
             if all(fresh.get(k, "無資訊") == "無資訊" for k in sensor_keys):
                 # 兩支 API 皆失敗時函式不拋錯、只回全「無資訊」的 JSON——不能標成「即時」
                 raise ValueError("兩支 API 皆無有效感測值")
-            latest = _fmt_reading(fresh, f"即時（{now_taipei().strftime('%H:%M')} 剛抓取）")
+            # 2026-11-03 審查修正 E（A2）：帶量測時間；感測器已停更時標「未更新」而非「即時」
+            latest = format_sensor_snapshot(fresh)
         except Exception as e:
             logger.warning(f"⚠️ [/status] 即時感測抓取失敗，退回最近一筆歷史: {redact(str(e))}")
         if latest is None:
@@ -156,7 +191,7 @@ async def handle_local_command(chat_id, text) -> bool:
                 recent = query_history_records(limit=1)
                 if recent:
                     r = recent[-1]
-                    latest = _fmt_reading(r, f"⚠️ 即時抓取失敗，以下是最近一筆歷史記錄（{r.get('timestamp', '')}），非現況")
+                    latest = _fmt_sensor_reading(r, f"⚠️ 即時抓取失敗，以下是最近一筆歷史記錄（{r.get('timestamp', '')}），非現況")
             except Exception as e:
                 latest = f"讀取失敗: {e}"
         await send_telegram_message(chat_id, (
@@ -326,7 +361,17 @@ async def handle_local_command(chat_id, text) -> bool:
             # 2026-11-02 審查修正：手動大幅調整後清掉當日錨點，讓 AI 的當日累計限幅
             # 以新值重新起算，否則接下來一整天 AI 連小幅微調都會被舊錨點擋下
             state.pop("threshold_anchor", None)
-        await asyncio.to_thread(update_state, _apply)
+        # 2026-11-03 審查修正 E（A4）：strict 模式寫檔，失敗不得宣稱已更新（state 檔仍是原值）
+        try:
+            await asyncio.to_thread(update_state, _apply, True)
+        except Exception as werr:
+            logger.error(f"❌ [/threshold] 門檻寫入失敗: {redact(str(werr))}")
+            cur = load_state()
+            await send_telegram_message(chat_id, (
+                f"⚠️ 門檻寫入失敗，設定未變（仍為 乾燥 < {cur.get('dry_threshold', DEFAULT_DRY_THRESHOLD)}% / "
+                f"積水 > {cur.get('wet_threshold', DEFAULT_WET_THRESHOLD)}%）。請稍後再試。"
+            ))
+            return True
         await send_telegram_message(chat_id, (
             f"✅ 警戒門檻已手動更新：乾燥 < {new_dry}% / 積水 > {new_wet}%\n"
             f"（手動指令不受 AI 自主調整的單次 ±{MAX_THRESHOLD_STEP} 百分點限幅）"

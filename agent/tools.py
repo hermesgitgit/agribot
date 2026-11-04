@@ -125,7 +125,15 @@ def tool_set_thresholds(dry: float, wet: float, lifecycle_stage: str) -> str:
         state["wet_threshold"] = new_wet
         return None
 
-    reject_reason = update_state(_apply)
+    # 2026-11-03 審查修正 E（A4）：strict 模式寫檔——以前 update_state 吞掉寫入例外，
+    # 磁碟滿／唯讀時工具仍回「✅ 已更新」，模型與使用者都以為門檻改了，state.json 其實是原值。
+    try:
+        reject_reason = update_state(_apply, strict=True)
+    except Exception as werr:
+        logger.error(f"❌ [Agentic Closed-Loop / 工具呼叫] 門檻寫入失敗: {werr}")
+        cur = load_state()
+        return (f"⚠️ 門檻寫入失敗，設定未變（仍為 乾燥 < {cur.get('dry_threshold', DEFAULT_DRY_THRESHOLD)}% / "
+                f"積水 > {cur.get('wet_threshold', DEFAULT_WET_THRESHOLD)}%）。請如實告知使用者稍後再試。")
     if reject_reason:
         return reject_reason
     logger.info(f"🔄 [Agentic Closed-Loop / 工具呼叫] 閾值已更新: dry={new_dry}%, wet={new_wet}%, state={lifecycle_stage}")

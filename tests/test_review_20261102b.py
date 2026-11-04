@@ -516,5 +516,199 @@ class TestPhotoFallbackWording(unittest.TestCase):
         self.assertIn("今天要澆水嗎", out)
 
 
+# ======================================================================
+# 2026-11-03 審查修正 E（外部審查第四輪）：A1 明確取消帶未來詞、A2 快照舊讀數標即時、
+# A3 哨兵未送達仍 record_push、A4 門檻寫檔失敗仍回成功
+# ======================================================================
+class TestE_A1ExplicitCancelBeforeFutureMarker(unittest.TestCase):
+    def test_explicit_cancel_with_future_word_is_no(self):
+        # 2026-11-03 審查修正 E（A1）：待確認收成時「這筆收成不用記了，明天再說」以前被「明天」
+        # 搶先判 unclear → 事件保留 → 逾時 sweep 自動落檔；明確喊停必須贏過未來詞
+        from agent.pending import classify_confirmation as cc
+        self.assertEqual(cc("這筆收成不用記了，明天再說", "harvest"), "no")
+        self.assertEqual(cc("收成取消，等一下再講", "harvest"), "no")
+        self.assertEqual(cc("這筆不用了，明天再說", "harvest"), "no")      # 通用事件詞＋否定
+        self.assertEqual(cc("施肥不用記了，明天再說", "fertilizer"), "no")
+
+    def test_pure_future_intent_still_unclear(self):
+        from agent.pending import classify_confirmation as cc
+        self.assertEqual(cc("我明天要施肥", "harvest"), "unclear")
+        self.assertEqual(cc("我明天要施肥", "fertilizer"), "unclear")
+        self.assertEqual(cc("等一下再記", "harvest"), "unclear")
+        self.assertEqual(cc("好，明天再登記", "harvest"), "unclear")       # 延後≠確認
+        self.assertEqual(cc("明天再說", "harvest"), "unclear")
+
+    def test_explicit_register_with_future_tail_is_yes(self):
+        from agent.pending import classify_confirmation as cc
+        self.assertEqual(cc("好，收成記下來，明天再施肥", "harvest"), "yes")
+        self.assertEqual(cc("幫我記，之後再看", "harvest"), "yes")
+        # 回歸：D 輪的既有判定不變
+        self.assertEqual(cc("施肥不用記", "harvest"), "unclear")
+        self.assertEqual(cc("確認要記錄空心菜", "harvest"), "yes")
+
+
+# ---------------------------------------------------------------- E-A2
+class TestE_A2SnapshotShowsMeasuredTime(unittest.TestCase):
+    def _reading(self, hours_old, stale):
+        t = datetime.datetime.now(TZ_TAIPEI) - datetime.timedelta(hours=hours_old)
+        return {
+            "air_temperature": "25.0 °C", "air_humidity": "80 %", "soil_temperature": "24.0 °C",
+            "soil_humidity": "28 %", "soil_ec": "0.5 ds/m",
+            "measured_at": t.isoformat(timespec="minutes"), "stale": stale,
+            "stale_hours": round(hours_old, 1) if stale else None,
+        }, t
+
+    def test_stale_reading_not_labelled_live(self):
+        from tg.handlers import format_sensor_snapshot
+        data, t = self._reading(12, True)
+        out = format_sensor_snapshot(data)
+        self.assertIn("未更新", out)
+        self.assertIn(t.strftime("%m-%d %H:%M"), out)      # 量測時間
+        self.assertIn("12", out)                           # 幾小時未更新
+        self.assertNotIn("即時", out)
+        self.assertIn("28 %", out)                         # 讀數仍顯示（標明是舊值）
+
+    def test_fresh_reading_shows_measured_time(self):
+        from tg.handlers import format_sensor_snapshot
+        data, t = self._reading(0.1, False)
+        out = format_sensor_snapshot(data)
+        self.assertIn("即時", out)
+        self.assertIn(t.strftime("%m-%d %H:%M"), out)
+        self.assertNotIn("未更新", out)
+
+    def test_status_command_uses_snapshot_formatter(self):
+        import tg.handlers as Hd
+        data, t = self._reading(12, True)
+        sent = []
+
+        async def fake_send(cid, text, *a, **k):
+            sent.append(text)
+            return True
+
+        with mock.patch.object(Hd, "get_agriweather_data", return_value=json.dumps(data)), \
+             mock.patch.object(Hd, "load_state", return_value={}), \
+             mock.patch.object(Hd, "send_telegram_message", fake_send):
+            asyncio.run(Hd.handle_local_command(1, "/status"))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("未更新", sent[0])
+        self.assertNotIn("即時（", sent[0])
+
+
+# ---------------------------------------------------------------- E-A3
+class _StopSentinel(BaseException):
+    """跳出 while True：用 BaseException 才不會被迴圈內的 except Exception 吃掉。"""
+
+
+class TestE_A3SentinelRecordPushOnlyWhenSent(unittest.TestCase):
+    ALERT_TEXT = "🚨【農事即時緊急預警】\n" + "1. 土壤濕度已跌破警戒值，請立即補水。\n" * 6
+
+    def _run(self, mode, send_ok):
+        """mode: normal／fallback／raw。回傳 (record_push 次數, 送出的訊息列表)。"""
+        import types
+        import services.sentinel as Se
+        calls = {"record": 0}
+        sent = []
+        sleeps = {"n": 0}
+
+        async def fake_sleep(_s):
+            sleeps["n"] += 1
+            if sleeps["n"] > 1:
+                raise _StopSentinel()
+
+        async def fake_send(cid, text, *a, **k):
+            sent.append(text)
+            return send_ok
+
+        fake_asyncio = types.SimpleNamespace(sleep=fake_sleep, to_thread=asyncio.to_thread)
+        if mode == "normal":
+            gen = mock.Mock(return_value=mock.Mock(text=self.ALERT_TEXT))
+        else:
+            gen = mock.Mock(side_effect=RuntimeError("503 overloaded"))
+        sensor = json.dumps({"soil_humidity": "8 %", "soil_ec": "0.5 ds/m", "stale": False})
+        with mock.patch.object(Se, "asyncio", fake_asyncio), \
+             mock.patch.object(Se, "load_state", return_value={"dry_threshold": 20, "wet_threshold": 40}), \
+             mock.patch.object(Se, "get_agriweather_data", return_value=sensor), \
+             mock.patch.object(Se, "get_cwa_alerts_report", return_value=""), \
+             mock.patch.object(Se, "fetch_cwa_observation", return_value=None), \
+             mock.patch.object(Se, "current_disease_risk", return_value=({"level": "低", "reasons": [], "diseases": []}, [])), \
+             mock.patch.object(Se, "get_cwa_weather_forecast", return_value="晴"), \
+             mock.patch.object(Se, "load_fertilizer_events", return_value=""), \
+             mock.patch.object(Se, "has_severe_weather", return_value=False), \
+             mock.patch.object(Se, "parse_sensor_block", return_value=("", "", "", "")), \
+             mock.patch.object(Se, "generate_oneshot_with_retry", gen), \
+             mock.patch.object(Se, "is_transient_api_error", return_value=(mode == "fallback")), \
+             mock.patch.object(Se, "generate_report_text", return_value="備援警報內容" if mode == "fallback" else ""), \
+             mock.patch.object(Se, "send_telegram_message", fake_send), \
+             mock.patch.object(Se, "record_push", side_effect=lambda *a, **k: calls.__setitem__("record", calls["record"] + 1)):
+            try:
+                asyncio.run(Se.hourly_safety_check_loop())
+            except _StopSentinel:
+                pass
+        return calls["record"], sent
+
+    def test_normal_path(self):
+        n, sent = self._run("normal", False)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(n, 0)                      # 未送達：不寫推播日誌／Hermes 信箱
+        n, sent = self._run("normal", True)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(n, 1)
+
+    def test_fallback_path(self):
+        n, sent = self._run("fallback", False)
+        self.assertTrue(any("備援" in t for t in sent))
+        self.assertEqual(n, 0)
+        n, sent = self._run("fallback", True)
+        self.assertEqual(n, 1)
+
+    def test_raw_alert_path(self):
+        n, sent = self._run("raw", False)
+        self.assertTrue(any("原始警報" in t for t in sent))
+        self.assertEqual(n, 0)
+        n, sent = self._run("raw", True)
+        self.assertEqual(n, 1)
+
+
+# ---------------------------------------------------------------- E-A4
+class TestE_A4ThresholdWriteFailure(unittest.TestCase):
+    def test_tool_reports_failure_and_keeps_state(self):
+        import agent.tools as T
+        with _TempState() as ts:
+            S = ts.S
+            self.assertTrue(S.save_state({"dry_threshold": 20.0, "wet_threshold": 40.0, "lifecycle": "幼苗期"}))
+            with mock.patch.object(S, "atomic_write_json", side_effect=OSError("read-only fs")):
+                out = T.tool_set_thresholds(22.0, 42.0, "seedling")
+            self.assertIn("寫入失敗", out)
+            self.assertNotIn("已更新", out)
+            self.assertIn("20", out)                                  # 報的是仍生效的原值
+            st = S.load_state()
+            self.assertEqual((st["dry_threshold"], st["wet_threshold"]), (20.0, 40.0))
+            # 正常寫入仍回成功
+            out_ok = T.tool_set_thresholds(22.0, 42.0, "seedling")
+            self.assertIn("已更新", out_ok)
+            st = S.load_state()
+            self.assertEqual((st["dry_threshold"], st["wet_threshold"]), (22.0, 42.0))
+
+    def test_threshold_command_reports_failure(self):
+        import tg.handlers as Hd
+        sent = []
+
+        async def fake_send(cid, text, *a, **k):
+            sent.append(text)
+            return True
+
+        with _TempState() as ts:
+            S = ts.S
+            S.save_state({"dry_threshold": 20.0, "wet_threshold": 40.0})
+            with mock.patch.object(S, "atomic_write_json", side_effect=OSError("disk full")), \
+                 mock.patch.object(Hd, "send_telegram_message", fake_send):
+                asyncio.run(Hd.handle_local_command(1, "/threshold dry=25 wet=45"))
+            self.assertEqual(len(sent), 1)
+            self.assertIn("寫入失敗", sent[0])
+            self.assertNotIn("已手動更新", sent[0])
+            st = S.load_state()
+            self.assertEqual((st["dry_threshold"], st["wet_threshold"]), (20.0, 40.0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
